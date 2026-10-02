@@ -40,4 +40,9 @@ describe('FinanceService transaction rules', () => {
       where: expect.objectContaining({ householdId: 'household_1', type: TransactionType.EXPENSE, accountId: 'cl333333333333333333333333' }),
     }));
   });
+
+  it('divides installments in cents deterministically and keeps month-end civil dates', () => {
+    expect((service as unknown as { splitAmount(total: number, count: number): number[] }).splitAmount(1000, 3)).toEqual([334, 333, 333]);
+    expect((service as unknown as { addMonths(date: string, months: number): Date }).addMonths('2026-01-31', 1).toISOString()).toBe('2026-02-28T12:00:00.000Z');
+  });
 });

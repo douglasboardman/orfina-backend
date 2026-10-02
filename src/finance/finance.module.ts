@@ -4,10 +4,11 @@ import { HouseholdsModule } from '../households/households.module';
 import { PrismaService } from '../prisma/prisma.service';
 import { FinanceController } from './finance.controller';
 import { FinanceService } from './finance.service';
+import { RecurringWorker } from './recurring.worker';
 
 @Module({
   imports: [HouseholdsModule, EventsModule],
   controllers: [FinanceController],
-  providers: [FinanceService, PrismaService],
+  providers: [FinanceService, PrismaService, RecurringWorker],
 })
 export class FinanceModule {}

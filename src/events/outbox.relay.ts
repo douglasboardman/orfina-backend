@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { connect, JetStreamClient, NatsConnection, StringCodec } from 'nats';
+import { randomUUID } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
 
 @Injectable()
@@ -15,6 +16,7 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
   private readonly maxAttempts = Number(process.env.OUTBOX_MAX_ATTEMPTS ?? 10);
   private readonly baseBackoffMs = Number(process.env.OUTBOX_BACKOFF_BASE_MS ?? 5000);
   private readonly maxBackoffMs = Number(process.env.OUTBOX_BACKOFF_MAX_MS ?? 3_600_000);
+  private readonly leaseMs = Number(process.env.OUTBOX_LEASE_MS ?? 30_000);
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -62,20 +64,36 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
     try {
       const now = new Date();
       const pending = await this.prisma.outboxEvent.findMany({
-        where: { status: 'PENDING', OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] },
+        where: {
+          status: 'PENDING',
+          AND: [
+            { OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }] },
+            { OR: [{ claimToken: null }, { claimedAt: { lte: new Date(now.getTime() - this.leaseMs) } }] },
+          ],
+        },
         orderBy: { createdAt: 'asc' },
         take: 50,
       });
       for (const event of pending) {
+        const claimToken = randomUUID();
+        const claimed = await this.prisma.outboxEvent.updateMany({
+          where: {
+            id: event.id,
+            status: 'PENDING',
+            OR: [{ claimToken: null }, { claimedAt: { lte: new Date(now.getTime() - this.leaseMs) } }],
+          },
+          data: { claimToken, claimedAt: new Date() },
+        });
+        if (!claimed.count) continue;
         try {
           await this.jetstream.publish(event.eventType, this.codec.encode(JSON.stringify({ id: event.id, version: event.version, payload: event.payload, occurredAt: event.createdAt })));
-          await this.prisma.outboxEvent.update({
-            where: { id: event.id },
-            data: { status: 'PUBLISHED', publishedAt: new Date(), attempts: { increment: 1 }, nextAttemptAt: null, lastError: null },
+          await this.prisma.outboxEvent.updateMany({
+            where: { id: event.id, claimToken },
+            data: { status: 'PUBLISHED', publishedAt: new Date(), attempts: { increment: 1 }, nextAttemptAt: null, lastError: null, claimToken: null, claimedAt: null },
           });
           this.logger.debug(JSON.stringify({ event: 'outbox.published', eventId: event.id, eventType: event.eventType, attempts: event.attempts + 1 }));
         } catch (error: unknown) {
-          await this.handlePublishFailure(event, error);
+          await this.handlePublishFailure(event, claimToken, error);
           this.jetstream = undefined;
           await this.connection?.close();
           this.connection = undefined;
@@ -87,18 +105,20 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async handlePublishFailure(event: { id: string; eventType: string; attempts: number }, error: unknown) {
+  private async handlePublishFailure(event: { id: string; eventType: string; attempts: number }, claimToken: string, error: unknown) {
     const attempts = event.attempts + 1;
     const failed = attempts >= this.maxAttempts;
     const delay = Math.min(this.baseBackoffMs * 2 ** Math.max(0, attempts - 1), this.maxBackoffMs);
     const message = this.errorMessage(error);
-    await this.prisma.outboxEvent.update({
-      where: { id: event.id },
+    await this.prisma.outboxEvent.updateMany({
+      where: { id: event.id, claimToken },
       data: {
         attempts,
         status: failed ? 'FAILED' : 'PENDING',
         nextAttemptAt: failed ? null : new Date(Date.now() + delay),
         lastError: message,
+        claimToken: null,
+        claimedAt: null,
       },
     });
     this.logger.warn(JSON.stringify({

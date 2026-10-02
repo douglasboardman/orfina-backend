@@ -22,6 +22,32 @@ enum AccountType {
   CASH
 }
 
+enum CardNetwork {
+  VISA
+  MASTERCARD
+  ELO
+  AMERICAN_EXPRESS
+  HIPERCARD
+  DINERS_CLUB
+  DISCOVER
+  JCB
+  UNIONPAY
+  MAESTRO
+  OTHER
+}
+
+enum CardStatementStatus {
+  OPEN
+  CLOSED
+  PAID
+}
+
+enum RecurringRuleStatus {
+  ACTIVE
+  PAUSED
+  ENDED
+}
+
 enum CategoryType {
   INCOME
   EXPENSE
@@ -68,6 +94,34 @@ model Household {
   accounts    Account[]
   categories  Category[]
   transactions Transaction[]
+  cards            Card[]
+  cardStatements   CardStatement[]
+  cardPayments     CardPayment[]
+  installmentPurchases InstallmentPurchase[]
+  recurringRules   RecurringRule[]
+  auditLogs        AuditLog[]
+}
+
+model Card {
+  id                 String      @id @default(cuid())
+  householdId        String
+  name               String
+  issuerName         String?
+  issuerLogoUrl      String?
+  network            CardNetwork
+  lastFour           String?
+  creditLimit        Int?
+  closingDay         Int         @default(1)
+  dueDay             Int         @default(10)
+  isActive           Boolean     @default(true)
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @updatedAt
+  household          Household   @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  transactions       Transaction[]
+  statements         CardStatement[]
+  installmentPurchases InstallmentPurchase[]
+  recurringRules     RecurringRule[]
+  @@index([householdId, isActive])
 }
 
 model HouseholdMember {
@@ -110,6 +164,8 @@ model Account {
   updatedAt      DateTime    @updatedAt
   household      Household   @relation(fields: [householdId], references: [id], onDelete: Cascade)
   transactions   Transaction[]
+  cardPayments   CardPayment[]
+  recurringRules RecurringRule[]
   @@index([householdId])
 }
 
@@ -126,6 +182,8 @@ model Category {
   household    Household    @relation(fields: [householdId], references: [id], onDelete: Cascade)
   subcategories Subcategory[]
   transactions  Transaction[]
+  installmentPurchases InstallmentPurchase[]
+  recurringRules RecurringRule[]
   @@unique([householdId, name, type])
   @@index([householdId, type])
 }
@@ -139,6 +197,8 @@ model Subcategory {
   updatedAt    DateTime      @updatedAt
   category     Category      @relation(fields: [categoryId], references: [id], onDelete: Cascade)
   transactions Transaction[]
+  installmentPurchases InstallmentPurchase[]
+  recurringRules RecurringRule[]
   @@unique([categoryId, name])
   @@index([categoryId])
 }
@@ -146,7 +206,13 @@ model Subcategory {
 model Transaction {
   id          String          @id @default(cuid())
   householdId String
-  accountId   String
+  accountId   String?
+  cardId      String?
+  statementId String?
+  installmentPurchaseId String?
+  installmentNumber Int?
+  recurringRuleId String?
+  recurrenceOn DateTime? @db.Date
   categoryId  String
   subcategoryId String
   type        TransactionType
@@ -157,12 +223,118 @@ model Transaction {
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
   household   Household       @relation(fields: [householdId], references: [id], onDelete: Cascade)
-  account     Account         @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  account     Account?        @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  card        Card?           @relation(fields: [cardId], references: [id], onDelete: Restrict)
+  statement   CardStatement?  @relation(fields: [statementId], references: [id], onDelete: Restrict)
+  installmentPurchase InstallmentPurchase? @relation(fields: [installmentPurchaseId], references: [id], onDelete: Restrict)
+  recurringRule RecurringRule? @relation(fields: [recurringRuleId], references: [id], onDelete: Restrict)
   category    Category        @relation(fields: [categoryId], references: [id], onDelete: Restrict)
   subcategory Subcategory     @relation(fields: [subcategoryId], references: [id], onDelete: Restrict)
   @@index([householdId, occurredOn])
   @@index([accountId, occurredOn])
+  @@index([cardId, occurredOn])
+  @@index([statementId])
+  @@index([installmentPurchaseId])
+  @@unique([recurringRuleId, recurrenceOn])
   @@index([subcategoryId])
+}
+
+model CardStatement {
+  id          String              @id @default(cuid())
+  householdId String
+  cardId      String
+  cycleStart  DateTime            @db.Date
+  cycleEnd    DateTime            @db.Date
+  dueOn       DateTime            @db.Date
+  totalAmount Int                 @default(0)
+  status      CardStatementStatus @default(OPEN)
+  closedAt    DateTime?
+  paidAt      DateTime?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+  household   Household           @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  card        Card                @relation(fields: [cardId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+  payments    CardPayment[]
+  @@unique([cardId, cycleEnd])
+  @@index([householdId, status, dueOn])
+}
+
+model CardPayment {
+  id             String        @id @default(cuid())
+  householdId    String
+  statementId    String
+  accountId      String
+  amount         Int
+  idempotencyKey String
+  paidOn         DateTime      @db.Date
+  createdAt      DateTime      @default(now())
+  household      Household     @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  statement      CardStatement @relation(fields: [statementId], references: [id], onDelete: Restrict)
+  account        Account       @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  @@unique([householdId, idempotencyKey])
+  @@index([statementId])
+  @@index([accountId, paidOn])
+}
+
+model InstallmentPurchase {
+  id              String      @id @default(cuid())
+  householdId     String
+  cardId          String
+  categoryId      String
+  subcategoryId   String
+  type            TransactionType
+  totalAmount     Int
+  installmentCount Int
+  description     String
+  firstOccurredOn DateTime    @db.Date
+  canceledAt      DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  household       Household   @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  card            Card        @relation(fields: [cardId], references: [id], onDelete: Restrict)
+  category        Category    @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  subcategory     Subcategory @relation(fields: [subcategoryId], references: [id], onDelete: Restrict)
+  transactions    Transaction[]
+  @@index([householdId, cardId])
+}
+
+model RecurringRule {
+  id            String              @id @default(cuid())
+  householdId   String
+  accountId     String?
+  cardId        String?
+  categoryId    String
+  subcategoryId String
+  type          TransactionType
+  amount        Int
+  description   String
+  notes         String?
+  startOn       DateTime            @db.Date
+  endOn         DateTime?           @db.Date
+  status        RecurringRuleStatus @default(ACTIVE)
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+  household     Household           @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  account       Account?            @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  card          Card?               @relation(fields: [cardId], references: [id], onDelete: Restrict)
+  category      Category             @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  subcategory   Subcategory          @relation(fields: [subcategoryId], references: [id], onDelete: Restrict)
+  transactions  Transaction[]
+  @@index([householdId, status])
+}
+
+model AuditLog {
+  id            String   @id @default(cuid())
+  householdId   String
+  actorId       String?
+  aggregateType String
+  aggregateId   String
+  action        String
+  changedFields Json?
+  createdAt     DateTime @default(now())
+  household     Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  @@index([householdId, aggregateType, aggregateId, createdAt])
 }
 
 model OutboxEvent {
@@ -175,8 +347,10 @@ model OutboxEvent {
   status        OutboxStatus @default(PENDING)
   attempts      Int         @default(0)
   nextAttemptAt DateTime?
+  claimToken    String?
+  claimedAt     DateTime?
   lastError     String?
   createdAt     DateTime    @default(now())
   publishedAt   DateTime?
-  @@index([status, nextAttemptAt, createdAt])
+  @@index([status, nextAttemptAt, claimedAt, createdAt])
 }
