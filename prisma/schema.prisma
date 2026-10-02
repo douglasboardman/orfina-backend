@@ -48,6 +48,13 @@ enum RecurringRuleStatus {
   ENDED
 }
 
+enum SavingsGoalStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+  ARCHIVED
+}
+
 enum CategoryType {
   INCOME
   EXPENSE
@@ -56,6 +63,34 @@ enum CategoryType {
 enum TransactionType {
   INCOME
   EXPENSE
+}
+
+enum TransactionStatus {
+  PENDING
+  POSTED
+  DISCARDED
+}
+
+enum AccountTransferStatus {
+  PENDING
+  POSTED
+  DISCARDED
+}
+
+enum ImportBatchStatus {
+  DRAFT
+  VALIDATED
+  COMMITTED
+  CANCELED
+  FAILED
+}
+
+enum ImportItemStatus {
+  VALID
+  INVALID
+  POSSIBLE_DUPLICATE
+  COMMITTED
+  CANCELED
 }
 
 enum OutboxStatus {
@@ -94,12 +129,19 @@ model Household {
   accounts    Account[]
   categories  Category[]
   transactions Transaction[]
+  transfers    AccountTransfer[]
+  importBatches ImportBatch[]
+  importItems   ImportItem[]
   cards            Card[]
   cardStatements   CardStatement[]
   cardPayments     CardPayment[]
   installmentPurchases InstallmentPurchase[]
   recurringRules   RecurringRule[]
   auditLogs        AuditLog[]
+  monthlyBudgets   MonthlyBudget[]
+  budgetMonths     BudgetMonth[]
+  savingsGoals     SavingsGoal[]
+  goalContributions GoalContribution[]
 }
 
 model Card {
@@ -164,6 +206,8 @@ model Account {
   updatedAt      DateTime    @updatedAt
   household      Household   @relation(fields: [householdId], references: [id], onDelete: Cascade)
   transactions   Transaction[]
+  outgoingTransfers AccountTransfer[] @relation("TransferSource")
+  incomingTransfers AccountTransfer[] @relation("TransferDestination")
   cardPayments   CardPayment[]
   recurringRules RecurringRule[]
   @@index([householdId])
@@ -184,6 +228,7 @@ model Category {
   transactions  Transaction[]
   installmentPurchases InstallmentPurchase[]
   recurringRules RecurringRule[]
+  monthlyBudgets MonthlyBudget[]
   @@unique([householdId, name, type])
   @@index([householdId, type])
 }
@@ -220,6 +265,8 @@ model Transaction {
   description String
   occurredOn  DateTime        @db.Date
   notes       String?
+  status      TransactionStatus @default(POSTED)
+  importItemId String? @unique
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
   household   Household       @relation(fields: [householdId], references: [id], onDelete: Cascade)
@@ -230,13 +277,76 @@ model Transaction {
   recurringRule RecurringRule? @relation(fields: [recurringRuleId], references: [id], onDelete: Restrict)
   category    Category        @relation(fields: [categoryId], references: [id], onDelete: Restrict)
   subcategory Subcategory     @relation(fields: [subcategoryId], references: [id], onDelete: Restrict)
+  importItem  ImportItem?     @relation(fields: [importItemId], references: [id], onDelete: SetNull)
   @@index([householdId, occurredOn])
+  @@index([householdId, status, occurredOn])
   @@index([accountId, occurredOn])
   @@index([cardId, occurredOn])
   @@index([statementId])
   @@index([installmentPurchaseId])
   @@unique([recurringRuleId, recurrenceOn])
   @@index([subcategoryId])
+}
+
+model AccountTransfer {
+  id                String                @id @default(cuid())
+  householdId       String
+  sourceAccountId   String
+  destinationAccountId String
+  amount            Int
+  occurredOn        DateTime              @db.Date
+  status            AccountTransferStatus @default(POSTED)
+  description       String?
+  importItemId      String?               @unique
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+  household         Household             @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  sourceAccount     Account               @relation("TransferSource", fields: [sourceAccountId], references: [id], onDelete: Restrict)
+  destinationAccount Account               @relation("TransferDestination", fields: [destinationAccountId], references: [id], onDelete: Restrict)
+  importItem        ImportItem?           @relation(fields: [importItemId], references: [id], onDelete: SetNull)
+  @@index([householdId, occurredOn])
+  @@index([sourceAccountId, occurredOn])
+  @@index([destinationAccountId, occurredOn])
+}
+
+model ImportBatch {
+  id              String            @id @default(cuid())
+  householdId     String
+  createdById     String
+  sourceHash      String
+  fileName        String?
+  format          String
+  mapping         Json?
+  status          ImportBatchStatus @default(DRAFT)
+  diagnostics     Json?
+  committedAt     DateTime?
+  canceledAt      DateTime?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  household       Household         @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  items           ImportItem[]
+  @@unique([householdId, sourceHash])
+  @@index([householdId, status, createdAt])
+}
+
+model ImportItem {
+  id              String           @id @default(cuid())
+  householdId     String
+  batchId         String
+  rowNumber       Int
+  fingerprint     String
+  status          ImportItemStatus @default(VALID)
+  data            Json
+  diagnostics     Json?
+  decidedById     String?
+  decidedAt       DateTime?
+  transaction     Transaction?
+  transfer        AccountTransfer?
+  batch           ImportBatch      @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  household       Household        @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  @@unique([batchId, rowNumber])
+  @@index([householdId, fingerprint])
+  @@index([batchId, status])
 }
 
 model CardStatement {
@@ -335,6 +445,67 @@ model AuditLog {
   createdAt     DateTime @default(now())
   household     Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
   @@index([householdId, aggregateType, aggregateId, createdAt])
+}
+
+model MonthlyBudget {
+  id             String   @id @default(cuid())
+  householdId    String
+  referenceMonth DateTime @db.Date
+  categoryId     String
+  limitAmount    Int
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  household      Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  category       Category  @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  @@unique([householdId, referenceMonth, categoryId])
+  @@index([householdId, referenceMonth])
+}
+
+model BudgetMonth {
+  id             String   @id @default(cuid())
+  householdId    String
+  referenceMonth DateTime @db.Date
+  closedAt       DateTime?
+  closedById     String?
+  snapshot       Json?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  household      Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  @@unique([householdId, referenceMonth])
+  @@index([householdId, closedAt])
+}
+
+model SavingsGoal {
+  id          String            @id @default(cuid())
+  householdId String
+  name        String
+  targetAmount Int
+  targetDate  DateTime?         @db.Date
+  color       String            @default("#5B5BD6")
+  icon        String?
+  status      SavingsGoalStatus @default(ACTIVE)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  household   Household         @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  contributions GoalContribution[]
+  @@index([householdId, status])
+}
+
+model GoalContribution {
+  id             String      @id @default(cuid())
+  householdId    String
+  goalId         String
+  actorId        String
+  amount         Int
+  occurredOn     DateTime    @db.Date
+  notes          String?
+  idempotencyKey String
+  createdAt      DateTime    @default(now())
+  household      Household   @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  goal           SavingsGoal @relation(fields: [goalId], references: [id], onDelete: Restrict)
+  @@unique([householdId, idempotencyKey])
+  @@index([goalId, occurredOn])
 }
 
 model OutboxEvent {

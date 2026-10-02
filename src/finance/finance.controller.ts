@@ -1,5 +1,5 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
-import { AccountType, CardNetwork, CategoryType, TransactionType } from '@prisma/client';
+import { AccountTransferStatus, AccountType, CardNetwork, CategoryType, TransactionStatus, TransactionType } from '@prisma/client';
 import { z } from 'zod';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
@@ -15,7 +15,9 @@ const activeSchema = z.object({ isActive: z.boolean() });
 const categorySchema = z.object({ name: z.string().trim().min(2).max(80), type: z.nativeEnum(CategoryType), color: z.string().regex(/^#[0-9A-Fa-f]{6}$/).default('#5B5BD6'), icon: z.string().trim().min(1).max(40).default('🏷️') });
 const categoryUpdateSchema = categorySchema.pick({ name: true, color: true, icon: true }).partial();
 const subcategorySchema = z.object({ name: z.string().trim().min(2).max(80) });
-const transactionSchema = z.object({ accountId: z.string().cuid().optional(), cardId: z.string().cuid().optional(), subcategoryId: z.string().cuid(), type: z.nativeEnum(TransactionType), amount: money.positive(), description: z.string().trim().min(2).max(160), occurredOn: z.string().date(), notes: z.string().trim().max(1000).optional() }).refine((data) => Boolean(data.accountId) !== Boolean(data.cardId), { message: 'Informe exatamente uma conta ou um cartão.', path: ['accountId'] });
+const transactionBaseSchema = z.object({ accountId: z.string().cuid().optional(), cardId: z.string().cuid().optional(), subcategoryId: z.string().cuid(), type: z.nativeEnum(TransactionType), amount: money.positive(), description: z.string().trim().min(2).max(160), occurredOn: z.string().date(), notes: z.string().trim().max(1000).optional() });
+const transactionSchema = transactionBaseSchema.extend({ status: z.nativeEnum(TransactionStatus).default(TransactionStatus.POSTED) }).refine((data) => Boolean(data.accountId) !== Boolean(data.cardId), { message: 'Informe exatamente uma conta ou um cartão.', path: ['accountId'] });
+const transactionUpdateSchema = transactionBaseSchema.extend({ status: z.nativeEnum(TransactionStatus).optional() }).refine((data) => Boolean(data.accountId) !== Boolean(data.cardId), { message: 'Informe exatamente uma conta ou um cartão.', path: ['accountId'] });
 const transactionListSchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
@@ -28,7 +30,10 @@ const transactionListSchema = z.object({
   categoryId: z.string().cuid().optional(),
   subcategoryId: z.string().cuid().optional(),
   type: z.nativeEnum(TransactionType).optional(),
+  status: z.nativeEnum(TransactionStatus).optional(),
+  importBatchId: z.string().cuid().optional(),
 });
+const transferSchema = z.object({ sourceAccountId: z.string().cuid(), destinationAccountId: z.string().cuid(), amount: money.positive(), occurredOn: z.string().date(), description: z.string().trim().min(2).max(160).optional(), status: z.nativeEnum(AccountTransferStatus).default(AccountTransferStatus.POSTED) }).refine((data) => data.sourceAccountId !== data.destinationAccountId, { message: 'Origem e destino devem ser diferentes.', path: ['destinationAccountId'] });
 const paymentSchema = z.object({ accountId: z.string().cuid(), amount: money.positive(), paidOn: z.string().date(), idempotencyKey: z.string().trim().min(8).max(120) });
 const installmentSchema = z.object({ cardId: z.string().cuid(), subcategoryId: z.string().cuid(), type: z.nativeEnum(TransactionType), totalAmount: money.positive(), installmentCount: z.number().int().min(2).max(120), description: z.string().trim().min(2).max(160), firstOccurredOn: z.string().date(), notes: z.string().trim().max(1000).optional() });
 const recurringRuleSchema = z.object({ accountId: z.string().cuid().optional(), cardId: z.string().cuid().optional(), subcategoryId: z.string().cuid(), type: z.nativeEnum(TransactionType), amount: money.positive(), description: z.string().trim().min(2).max(160), notes: z.string().trim().max(1000).optional(), startOn: z.string().date(), endOn: z.string().date().optional() }).refine((data) => Boolean(data.accountId) !== Boolean(data.cardId), { message: 'Informe exatamente uma conta ou um cartão.', path: ['accountId'] }).refine((data) => !data.endOn || data.endOn >= data.startOn, { message: 'A data final deve ser posterior à inicial.', path: ['endOn'] });
@@ -65,6 +70,10 @@ export class FinanceController {
   @Patch('subcategories/:subcategoryId/status') setSubcategoryStatus(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('subcategoryId') subcategoryId: string, @Body() body: unknown) { return this.finance.setSubcategoryStatus(user.id, householdId, subcategoryId, activeSchema.parse(body).isActive); }
   @Get('transactions') listTransactions(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Query() query: unknown) { return this.finance.listTransactions(user.id, householdId, transactionListSchema.parse(query)); }
   @Post('transactions') createTransaction(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Body() body: unknown) { return this.finance.createTransaction(user.id, householdId, transactionSchema.parse(body)); }
-  @Patch('transactions/:transactionId') updateTransaction(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('transactionId') transactionId: string, @Body() body: unknown) { return this.finance.updateTransaction(user.id, householdId, transactionId, transactionSchema.parse(body)); }
+  @Patch('transactions/:transactionId') updateTransaction(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('transactionId') transactionId: string, @Body() body: unknown) { return this.finance.updateTransaction(user.id, householdId, transactionId, transactionUpdateSchema.parse(body)); }
   @Delete('transactions/:transactionId') deleteTransaction(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('transactionId') transactionId: string) { return this.finance.deleteTransaction(user.id, householdId, transactionId); }
+  @Patch('transactions/:transactionId/status') setTransactionStatus(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('transactionId') transactionId: string, @Body() body: unknown) { return this.finance.setTransactionStatus(user.id, householdId, transactionId, z.object({ status: z.nativeEnum(TransactionStatus) }).parse(body).status); }
+  @Get('transfers') listTransfers(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string) { return this.finance.listTransfers(user.id, householdId); }
+  @Post('transfers') createTransfer(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Body() body: unknown) { return this.finance.createTransfer(user.id, householdId, transferSchema.parse(body)); }
+  @Patch('transfers/:transferId/status') setTransferStatus(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('transferId') transferId: string, @Body() body: unknown) { return this.finance.setTransferStatus(user.id, householdId, transferId, z.object({ status: z.nativeEnum(AccountTransferStatus) }).parse(body).status); }
 }

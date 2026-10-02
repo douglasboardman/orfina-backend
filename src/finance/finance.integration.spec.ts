@@ -1,8 +1,10 @@
-import { ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { CardNetwork, PrismaClient, TransactionType } from '@prisma/client';
 import { EventsService } from '../events/events.service';
 import { HouseholdsService } from '../households/households.service';
 import { FinanceService } from './finance.service';
+import { PlanningService } from '../planning/planning.service';
+import { ImportsService } from '../imports/imports.service';
 
 const integration = process.env.DATABASE_URL ? describe : describe.skip;
 
@@ -11,6 +13,8 @@ integration('Finance integration (PostgreSQL)', () => {
   const events = new EventsService(prisma as never);
   const households = new HouseholdsService(prisma as never, events);
   const finance = new FinanceService(prisma as never, households, events);
+  const planning = new PlanningService(prisma as never, households, events);
+  const imports = new ImportsService(prisma as never, households, events);
   const suffix = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
   let householdId = '';
   let ownerId = '';
@@ -92,5 +96,48 @@ integration('Finance integration (PostgreSQL)', () => {
     await finance.materializeRecurringRules(new Date('2026-10-02T12:00:00.000Z'));
     const recurring = await prisma.transaction.findMany({ where: { householdId, recurringRuleId: { not: null } } });
     expect(recurring).toHaveLength(1);
+  });
+
+  it('keeps budgets and goals tenant-scoped, auditable and idempotent', async () => {
+    const account = await finance.createAccount(ownerId, householdId, { name: 'Conta orçamento', type: 'CHECKING', initialBalance: 0 });
+    const category = await finance.createCategory(ownerId, householdId, { name: `Orçamento ${suffix}`, type: 'EXPENSE', color: '#5B5BD6', icon: 'sell' });
+    const subcategory = await finance.createSubcategory(ownerId, householdId, category.id, { name: 'Despesa planejada' });
+    await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, amount: 750, description: 'Consumo do orçamento', occurredOn: '2026-10-04' });
+    await planning.upsertBudget(ownerId, householdId, '2026-10', { categoryId: category.id, limitAmount: 1_000 });
+    const summary = await planning.budgetSummary(ownerId, householdId, '2026-10');
+    expect(summary.rows.find((row) => row.categoryId === category.id)).toEqual(expect.objectContaining({ spentAmount: 750, availableAmount: 250 }));
+    await planning.setMonthClosed(ownerId, householdId, '2026-10', true);
+    await expect(planning.upsertBudget(ownerId, householdId, '2026-10', { categoryId: category.id, limitAmount: 1_500 })).rejects.toBeInstanceOf(BadRequestException);
+    await planning.setMonthClosed(ownerId, householdId, '2026-10', false);
+
+    const goal = await planning.createGoal(ownerId, householdId, { name: 'Reserva familiar', targetAmount: 2_000, color: '#5B5BD6' });
+    const first = await planning.contributeToGoal(ownerId, householdId, goal.id, { amount: 500, occurredOn: '2026-10-04', idempotencyKey: `goal-${suffix}` });
+    const retried = await planning.contributeToGoal(ownerId, householdId, goal.id, { amount: 500, occurredOn: '2026-10-04', idempotencyKey: `goal-${suffix}` });
+    expect(retried.id).toBe(first.id);
+    expect((await planning.listGoals(ownerId, householdId)).find((item) => item.id === goal.id)).toEqual(expect.objectContaining({ savedAmount: 500, remainingAmount: 1_500 }));
+    await expect(planning.contributeToGoal(outsiderId, householdId, goal.id, { amount: 1, occurredOn: '2026-10-04', idempotencyKey: `outside-goal-${suffix}` })).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it('keeps pending movements out of available balance and commits a reviewed CSV only once', async () => {
+    const source = await finance.createAccount(ownerId, householdId, { name: `Origem ${suffix}`, type: 'CHECKING', initialBalance: 10_000 });
+    const destination = await finance.createAccount(ownerId, householdId, { name: `Destino ${suffix}`, type: 'SAVINGS', initialBalance: 0 });
+    const category = await finance.createCategory(ownerId, householdId, { name: `Importação ${suffix}`, type: 'EXPENSE', color: '#5B5BD6', icon: 'receipt_long' });
+    const subcategory = await finance.createSubcategory(ownerId, householdId, category.id, { name: 'Revisada' });
+
+    await finance.createTransaction(ownerId, householdId, { accountId: source.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, amount: 1_500, description: 'Pendente', occurredOn: '2026-10-02', status: 'PENDING' as never });
+    await finance.createTransfer(ownerId, householdId, { sourceAccountId: source.id, destinationAccountId: destination.id, amount: 2_000, occurredOn: '2026-10-02' });
+    const balances = await finance.listAccounts(ownerId, householdId);
+    expect(balances.find((account) => account.id === source.id)?.balance).toBe(8_000);
+    expect(balances.find((account) => account.id === destination.id)?.balance).toBe(2_000);
+
+    const csv = `Data;Descrição;Valor;Tipo;Categoria;Subcategoria;Situação\n2026-10-03;Importação revisada;-12,34;Despesa;${category.name};${subcategory.name};Pendente\n`;
+    const preview = await imports.preview(ownerId, householdId, { fileName: 'movimentos.csv', contentBase64: Buffer.from(csv).toString('base64'), mapping: {}, accountId: source.id });
+    expect(preview.status).toBe('VALIDATED');
+    expect((await imports.get(ownerId, householdId, preview.id)).items[0].status).toBe('VALID');
+    await imports.commit(ownerId, householdId, preview.id, { createMissingCategories: false });
+    const retriedPreview = await imports.preview(ownerId, householdId, { fileName: 'movimentos.csv', contentBase64: Buffer.from(csv).toString('base64'), mapping: {}, accountId: source.id });
+    expect(retriedPreview.id).toBe(preview.id);
+    expect((await finance.listTransactions(ownerId, householdId, { page: 1, pageSize: 100, importBatchId: preview.id })).items).toHaveLength(1);
+    expect((await finance.overview(ownerId, householdId)).pendingCommitments).toBeGreaterThanOrEqual(2_734);
   });
 });

@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { AccountType, CardNetwork, CardStatementStatus, CategoryType, Prisma, RecurringRuleStatus, TransactionType } from '@prisma/client';
+import { AccountTransferStatus, AccountType, CardNetwork, CardStatementStatus, CategoryType, Prisma, RecurringRuleStatus, TransactionStatus, TransactionType } from '@prisma/client';
 import { EventsService } from '../events/events.service';
 import { HouseholdsService } from '../households/households.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -11,8 +11,9 @@ type UpdateCard = Partial<CreateCard>;
 type CreateCategory = { name: string; type: CategoryType; color: string; icon?: string };
 type UpdateCategory = Partial<Pick<CreateCategory, 'name' | 'color' | 'icon'>>;
 type CreateSubcategory = { name: string };
-type CreateTransaction = { accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; amount: number; description: string; occurredOn: string; notes?: string };
-type TransactionListFilters = { page: number; pageSize: number; from?: string; to?: string; accountId?: string; cardId?: string; statementId?: string; recurringRuleId?: string; categoryId?: string; subcategoryId?: string; type?: TransactionType };
+type CreateTransaction = { accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; amount: number; description: string; occurredOn: string; notes?: string; status?: TransactionStatus };
+type TransactionListFilters = { page: number; pageSize: number; from?: string; to?: string; accountId?: string; cardId?: string; statementId?: string; recurringRuleId?: string; categoryId?: string; subcategoryId?: string; type?: TransactionType; status?: TransactionStatus; importBatchId?: string };
+type CreateTransfer = { sourceAccountId: string; destinationAccountId: string; amount: number; occurredOn: string; description?: string; status?: AccountTransferStatus };
 type StatementPayment = { accountId: string; amount: number; paidOn: string; idempotencyKey: string };
 type InstallmentPurchaseInput = { cardId: string; subcategoryId: string; type: TransactionType; totalAmount: number; installmentCount: number; description: string; firstOccurredOn: string; notes?: string };
 type RecurringRuleInput = { accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; amount: number; description: string; notes?: string; startOn: string; endOn?: string };
@@ -27,22 +28,26 @@ export class FinanceService {
 
   async overview(userId: string, householdId: string) {
     await this.households.assertMember(userId, householdId);
-    const [accounts, transactions, statements, recurringRules] = await Promise.all([
-      this.prisma.account.findMany({ where: { householdId, isActive: true }, include: { transactions: true, cardPayments: true }, orderBy: { name: 'asc' } }),
+    const [accounts, transactions, pendingTransactions, statements, recurringRules] = await Promise.all([
+      this.prisma.account.findMany({ where: { householdId, isActive: true }, include: { transactions: true, cardPayments: true, outgoingTransfers: true, incomingTransfers: true }, orderBy: { name: 'asc' } }),
       this.prisma.transaction.findMany({ where: { householdId }, include: { category: true, subcategory: true, account: true, card: true }, orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }], take: 8 }),
+      this.prisma.transaction.findMany({ where: { householdId, status: TransactionStatus.PENDING }, select: { amount: true, type: true } }),
       this.prisma.cardStatement.findMany({ where: { householdId, status: { not: CardStatementStatus.PAID } }, include: { card: true, payments: true }, orderBy: { dueOn: 'asc' }, take: 5 }),
       this.prisma.recurringRule.findMany({ where: { householdId, status: RecurringRuleStatus.ACTIVE }, select: { id: true, amount: true, description: true, startOn: true, endOn: true } }),
     ]);
     const accountSummaries = accounts.map((account) => {
-      const movement = account.transactions.reduce((sum, item) => sum + (item.type === 'INCOME' ? item.amount : -item.amount), 0);
+      const movement = account.transactions.filter((item) => item.status === TransactionStatus.POSTED).reduce((sum, item) => sum + (item.type === 'INCOME' ? item.amount : -item.amount), 0);
       const payments = account.cardPayments.reduce((sum, payment) => sum + payment.amount, 0);
-      return { ...account, transactions: undefined, cardPayments: undefined, balance: account.initialBalance + movement - payments };
+      const transfersOut = account.outgoingTransfers.filter((transfer) => transfer.status === AccountTransferStatus.POSTED).reduce((sum, transfer) => sum + transfer.amount, 0);
+      const transfersIn = account.incomingTransfers.filter((transfer) => transfer.status === AccountTransferStatus.POSTED).reduce((sum, transfer) => sum + transfer.amount, 0);
+      return { ...account, transactions: undefined, cardPayments: undefined, outgoingTransfers: undefined, incomingTransfers: undefined, balance: account.initialBalance + movement - payments - transfersOut + transfersIn };
     });
     return {
       totalBalance: accountSummaries.reduce((sum, account) => sum + account.balance, 0),
       accounts: accountSummaries,
       recentTransactions: transactions,
       cardOpenTotal: statements.reduce((sum, statement) => sum + Math.max(0, statement.totalAmount - statement.payments.reduce((paid, payment) => paid + payment.amount, 0)), 0),
+      pendingCommitments: pendingTransactions.reduce((sum, transaction) => sum + (transaction.type === TransactionType.EXPENSE ? transaction.amount : -transaction.amount), 0),
       upcomingStatements: statements,
       recurringForecast: recurringRules,
     };
@@ -50,11 +55,13 @@ export class FinanceService {
 
   async listAccounts(userId: string, householdId: string) {
     await this.households.assertMember(userId, householdId);
-    const accounts = await this.prisma.account.findMany({ where: { householdId }, include: { transactions: true, cardPayments: true }, orderBy: { name: 'asc' } });
+    const accounts = await this.prisma.account.findMany({ where: { householdId }, include: { transactions: true, cardPayments: true, outgoingTransfers: true, incomingTransfers: true }, orderBy: { name: 'asc' } });
     return accounts.map((account) => {
-      const movement = account.transactions.reduce((sum, item) => sum + (item.type === 'INCOME' ? item.amount : -item.amount), 0);
+      const movement = account.transactions.filter((item) => item.status === TransactionStatus.POSTED).reduce((sum, item) => sum + (item.type === 'INCOME' ? item.amount : -item.amount), 0);
       const payments = account.cardPayments.reduce((sum, payment) => sum + payment.amount, 0);
-      return { ...account, transactions: undefined, cardPayments: undefined, balance: account.initialBalance + movement - payments };
+      const transfersOut = account.outgoingTransfers.filter((transfer) => transfer.status === AccountTransferStatus.POSTED).reduce((sum, transfer) => sum + transfer.amount, 0);
+      const transfersIn = account.incomingTransfers.filter((transfer) => transfer.status === AccountTransferStatus.POSTED).reduce((sum, transfer) => sum + transfer.amount, 0);
+      return { ...account, transactions: undefined, cardPayments: undefined, outgoingTransfers: undefined, incomingTransfers: undefined, balance: account.initialBalance + movement - payments - transfersOut + transfersIn };
     });
   }
 
@@ -252,6 +259,8 @@ export class FinanceService {
       categoryId: filters.categoryId,
       subcategoryId: filters.subcategoryId,
       type: filters.type,
+      status: filters.status,
+      importItem: filters.importBatchId ? { batchId: filters.importBatchId } : undefined,
     };
     if (filters.from || filters.to) {
       where.occurredOn = {
@@ -295,8 +304,8 @@ export class FinanceService {
       if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
       await this.events.record(tx, {
         aggregateType: 'transaction', aggregateId: transaction.id,
-        eventType: 'orfina.transactions.transaction-posted.v1',
-        payload: { transactionId: transaction.id, householdId, accountId: transaction.accountId, cardId: transaction.cardId, categoryId: transaction.categoryId, type: transaction.type, amount: transaction.amount, occurredOn: transaction.occurredOn.toISOString() },
+        eventType: `orfina.transactions.transaction-${transaction.status === TransactionStatus.PENDING ? 'pending' : 'posted'}.v1`,
+        payload: { transactionId: transaction.id, householdId, accountId: transaction.accountId, cardId: transaction.cardId, categoryId: transaction.categoryId, type: transaction.type, status: transaction.status },
       });
       await this.audit(tx, householdId, userId, 'transaction', transaction.id, 'created', ['accountId', 'cardId', 'subcategoryId', 'type', 'amount', 'occurredOn']);
       return transaction;
@@ -366,6 +375,49 @@ export class FinanceService {
       });
       await this.audit(tx, householdId, userId, 'transaction', transactionId, 'deleted', ['accountId', 'cardId', 'subcategoryId', 'type', 'amount']);
       return { id: transactionId, deleted: true };
+    });
+  }
+
+  async setTransactionStatus(userId: string, householdId: string, transactionId: string, status: TransactionStatus) {
+    await this.households.assertCanWrite(userId, householdId);
+    const transaction = await this.prisma.transaction.findFirst({ where: { id: transactionId, householdId } });
+    if (!transaction) throw new NotFoundException('Lançamento não encontrado neste grupo familiar.');
+    if (transaction.statementId) throw new BadRequestException('A situação de lançamento de cartão é controlada pela fatura.');
+    return this.prisma.$transaction(async (tx) => {
+      const updated = await tx.transaction.update({ where: { id: transactionId }, data: { status } });
+      await this.events.record(tx, { aggregateType: 'transaction', aggregateId: transactionId, eventType: 'orfina.transactions.status-changed.v1', payload: { householdId, transactionId, status } });
+      await this.audit(tx, householdId, userId, 'transaction', transactionId, 'status-changed', ['status']);
+      return updated;
+    });
+  }
+
+  async listTransfers(userId: string, householdId: string) {
+    await this.households.assertMember(userId, householdId);
+    return this.prisma.accountTransfer.findMany({ where: { householdId }, include: { sourceAccount: true, destinationAccount: true, importItem: { select: { batchId: true } } }, orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }] });
+  }
+
+  async createTransfer(userId: string, householdId: string, dto: CreateTransfer) {
+    await this.households.assertCanManage(userId, householdId);
+    if (dto.sourceAccountId === dto.destinationAccountId) throw new BadRequestException('Origem e destino da transferência devem ser contas diferentes.');
+    const accounts = await this.prisma.account.count({ where: { householdId, isActive: true, id: { in: [dto.sourceAccountId, dto.destinationAccountId] } } });
+    if (accounts !== 2) throw new NotFoundException('As contas da transferência devem ser ativas e pertencer ao grupo familiar.');
+    return this.prisma.$transaction(async (tx) => {
+      const transfer = await tx.accountTransfer.create({ data: { householdId, ...dto, occurredOn: this.civilDate(dto.occurredOn), status: dto.status ?? AccountTransferStatus.POSTED }, include: { sourceAccount: true, destinationAccount: true } });
+      await this.events.record(tx, { aggregateType: 'transfer', aggregateId: transfer.id, eventType: 'orfina.transfers.transfer-created.v1', payload: { householdId, transferId: transfer.id, status: transfer.status } });
+      await this.audit(tx, householdId, userId, 'transfer', transfer.id, 'created', ['sourceAccountId', 'destinationAccountId', 'status']);
+      return transfer;
+    });
+  }
+
+  async setTransferStatus(userId: string, householdId: string, transferId: string, status: AccountTransferStatus) {
+    await this.households.assertCanManage(userId, householdId);
+    const transfer = await this.prisma.accountTransfer.findFirst({ where: { id: transferId, householdId } });
+    if (!transfer) throw new NotFoundException('Transferência não encontrada neste grupo familiar.');
+    return this.prisma.$transaction(async (tx) => {
+      const updated = await tx.accountTransfer.update({ where: { id: transferId }, data: { status } });
+      await this.events.record(tx, { aggregateType: 'transfer', aggregateId: transferId, eventType: 'orfina.transfers.transfer-status-changed.v1', payload: { householdId, transferId, status } });
+      await this.audit(tx, householdId, userId, 'transfer', transferId, 'status-changed', ['status']);
+      return updated;
     });
   }
 

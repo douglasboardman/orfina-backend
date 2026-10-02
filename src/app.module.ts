@@ -5,6 +5,8 @@ import { HouseholdsModule } from './households/households.module';
 import { FinanceModule } from './finance/finance.module';
 import { PrismaService } from './prisma/prisma.service';
 import { EventsModule } from './events/events.module';
+import { PlanningModule } from './planning/planning.module';
+import { ImportsModule } from './imports/imports.module';
 
 @Module({
   imports: [
@@ -13,6 +15,8 @@ import { EventsModule } from './events/events.module';
     HouseholdsModule,
     FinanceModule,
     EventsModule,
+    PlanningModule,
+    ImportsModule,
   ],
   providers: [PrismaService],
 })
