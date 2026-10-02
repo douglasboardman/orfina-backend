@@ -1,0 +1,182 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum HouseholdRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum AccountType {
+  CHECKING
+  SALARY
+  SAVINGS
+  INVESTMENT
+  CASH
+}
+
+enum CategoryType {
+  INCOME
+  EXPENSE
+}
+
+enum TransactionType {
+  INCOME
+  EXPENSE
+}
+
+enum OutboxStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+enum HouseholdInvitationStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
+
+model User {
+  id           String            @id @default(cuid())
+  email        String            @unique
+  name         String
+  avatarUrl    String?
+  googleId     String?           @unique
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+  memberships  HouseholdMember[]
+}
+
+model Household {
+  id          String            @id @default(cuid())
+  name        String
+  currency    String            @default("BRL")
+  timezone    String            @default("America/Sao_Paulo")
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  members     HouseholdMember[]
+  invitations HouseholdInvitation[]
+  accounts    Account[]
+  categories  Category[]
+  transactions Transaction[]
+}
+
+model HouseholdMember {
+  householdId String
+  userId      String
+  role        HouseholdRole @default(MEMBER)
+  createdAt   DateTime      @default(now())
+  household   Household     @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@id([householdId, userId])
+  @@index([userId])
+}
+
+model HouseholdInvitation {
+  id          String                    @id @default(cuid())
+  householdId String
+  email       String
+  role        HouseholdRole             @default(MEMBER)
+  status      HouseholdInvitationStatus @default(PENDING)
+  invitedById String
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime                  @default(now())
+  updatedAt   DateTime                  @updatedAt
+  household   Household                 @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  @@index([householdId, status])
+  @@index([email, status])
+}
+
+model Account {
+  id             String      @id @default(cuid())
+  householdId    String
+  name           String
+  type           AccountType
+  bankName       String?
+  bankLogoUrl    String?
+  initialBalance Int         @default(0)
+  isActive       Boolean     @default(true)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  household      Household   @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  transactions   Transaction[]
+  @@index([householdId])
+}
+
+model Category {
+  id          String       @id @default(cuid())
+  householdId String
+  name        String
+  type        CategoryType
+  color       String       @default("#5B5BD6")
+  icon        String?
+  isActive    Boolean      @default(true)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  household    Household    @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  subcategories Subcategory[]
+  transactions  Transaction[]
+  @@unique([householdId, name, type])
+  @@index([householdId, type])
+}
+
+model Subcategory {
+  id           String        @id @default(cuid())
+  categoryId   String
+  name         String
+  isActive     Boolean       @default(true)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  category     Category      @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+  @@unique([categoryId, name])
+  @@index([categoryId])
+}
+
+model Transaction {
+  id          String          @id @default(cuid())
+  householdId String
+  accountId   String
+  categoryId  String
+  subcategoryId String
+  type        TransactionType
+  amount      Int
+  description String
+  occurredOn  DateTime        @db.Date
+  notes       String?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  household   Household       @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  account     Account         @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  category    Category        @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  subcategory Subcategory     @relation(fields: [subcategoryId], references: [id], onDelete: Restrict)
+  @@index([householdId, occurredOn])
+  @@index([accountId, occurredOn])
+  @@index([subcategoryId])
+}
+
+model OutboxEvent {
+  id            String      @id @default(cuid())
+  aggregateType String
+  aggregateId   String
+  eventType     String
+  version       Int         @default(1)
+  payload       Json
+  status        OutboxStatus @default(PENDING)
+  attempts      Int         @default(0)
+  nextAttemptAt DateTime?
+  lastError     String?
+  createdAt     DateTime    @default(now())
+  publishedAt   DateTime?
+  @@index([status, nextAttemptAt, createdAt])
+}
