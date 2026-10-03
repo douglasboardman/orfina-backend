@@ -7,7 +7,7 @@ import { allowedOrigins, CsrfGuard } from './auth/csrf.guard';
 type RateBucket = { count: number; resetAt: number };
 const rateBuckets = new Map<string, RateBucket>();
 
-const rateLimit = (request: { ip: string; url: string }, reply: { code(value: number): { send(body: unknown): unknown } }) => {
+const rateLimit = async (request: { ip: string; url: string }, reply: { code(value: number): { send(body: unknown): unknown } }) => {
   const route = request.url.split('?')[0];
   const protectedRoute = route === '/api/auth/google' || route.startsWith('/api/imports') || route.includes('/imports');
   if (!protectedRoute) return;
