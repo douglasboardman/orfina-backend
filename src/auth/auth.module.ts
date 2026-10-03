@@ -8,6 +8,7 @@ import { GoogleStrategy } from './google.strategy';
 import { JwtStrategy } from './jwt.strategy';
 import { GoogleAuthGuard } from './google-auth.guard';
 import { PrismaService } from '../prisma/prisma.service';
+import { CsrfGuard } from './csrf.guard';
 
 @Module({
   imports: [
@@ -22,7 +23,7 @@ import { PrismaService } from '../prisma/prisma.service';
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, GoogleStrategy, JwtStrategy, GoogleAuthGuard, PrismaService],
-  exports: [AuthService],
+  providers: [AuthService, GoogleStrategy, JwtStrategy, GoogleAuthGuard, CsrfGuard, PrismaService],
+  exports: [AuthService, CsrfGuard],
 })
 export class AuthModule {}

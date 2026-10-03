@@ -26,14 +26,20 @@ export class FinanceService {
     private readonly events: EventsService,
   ) {}
 
-  async overview(userId: string, householdId: string) {
+  async overview(userId: string, householdId: string, requestedMonth?: string) {
     await this.households.assertMember(userId, householdId);
-    const [accounts, transactions, pendingTransactions, statements, recurringRules] = await Promise.all([
+    const referenceMonth = this.monthStart(requestedMonth ?? new Date().toISOString().slice(0, 7));
+    const previousMonth = this.addMonths(referenceMonth, -1);
+    const { start, end } = this.monthRange(referenceMonth);
+    const previousRange = this.monthRange(previousMonth);
+    const [accounts, transactions, monthTransactions, previousTransactions, statements, recurringRules, budgets] = await Promise.all([
       this.prisma.account.findMany({ where: { householdId, isActive: true }, include: { transactions: true, cardPayments: true, outgoingTransfers: true, incomingTransfers: true }, orderBy: { name: 'asc' } }),
-      this.prisma.transaction.findMany({ where: { householdId }, include: { category: true, subcategory: true, account: true, card: true }, orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }], take: 8 }),
-      this.prisma.transaction.findMany({ where: { householdId, status: TransactionStatus.PENDING }, select: { amount: true, type: true } }),
+      this.prisma.transaction.findMany({ where: { householdId, occurredOn: { gte: start, lt: end } }, include: { category: true, subcategory: true, account: true, card: true }, orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }], take: 8 }),
+      this.prisma.transaction.findMany({ where: { householdId, occurredOn: { gte: start, lt: end } }, include: { category: true }, orderBy: { occurredOn: 'asc' } }),
+      this.prisma.transaction.findMany({ where: { householdId, occurredOn: { gte: previousRange.start, lt: previousRange.end } }, select: { amount: true, type: true, status: true } }),
       this.prisma.cardStatement.findMany({ where: { householdId, status: { not: CardStatementStatus.PAID } }, include: { card: true, payments: true }, orderBy: { dueOn: 'asc' }, take: 5 }),
       this.prisma.recurringRule.findMany({ where: { householdId, status: RecurringRuleStatus.ACTIVE }, select: { id: true, amount: true, description: true, startOn: true, endOn: true } }),
+      this.prisma.monthlyBudget.findMany({ where: { householdId, referenceMonth }, select: { categoryId: true, limitAmount: true } }),
     ]);
     const accountSummaries = accounts.map((account) => {
       const movement = account.transactions.filter((item) => item.status === TransactionStatus.POSTED).reduce((sum, item) => sum + (item.type === 'INCOME' ? item.amount : -item.amount), 0);
@@ -42,14 +48,47 @@ export class FinanceService {
       const transfersIn = account.incomingTransfers.filter((transfer) => transfer.status === AccountTransferStatus.POSTED).reduce((sum, transfer) => sum + transfer.amount, 0);
       return { ...account, transactions: undefined, cardPayments: undefined, outgoingTransfers: undefined, incomingTransfers: undefined, balance: account.initialBalance + movement - payments - transfersOut + transfersIn };
     });
+    const posted = monthTransactions.filter((transaction) => transaction.status === TransactionStatus.POSTED);
+    const realizedIncome = this.sumByType(posted, TransactionType.INCOME);
+    const realizedExpenses = this.sumByType(posted, TransactionType.EXPENSE);
+    const pendingCommitments = this.sumByType(monthTransactions.filter((transaction) => transaction.status === TransactionStatus.PENDING), TransactionType.EXPENSE);
+    const previousPosted = previousTransactions.filter((transaction) => transaction.status === TransactionStatus.POSTED);
+    const previousIncome = this.sumByType(previousPosted, TransactionType.INCOME);
+    const previousExpenses = this.sumByType(previousPosted, TransactionType.EXPENSE);
+    const weekly = Array.from({ length: 5 }, (_, index) => ({ week: index + 1, income: 0, expenses: 0 }));
+    const categoryTotals = new Map<string, { categoryId: string; name: string; color: string; amount: number }>();
+    for (const transaction of posted) {
+      const week = Math.min(4, Math.floor((transaction.occurredOn.getUTCDate() - 1) / 7));
+      if (transaction.type === TransactionType.INCOME) weekly[week].income += transaction.amount;
+      else {
+        weekly[week].expenses += transaction.amount;
+        const category = categoryTotals.get(transaction.categoryId) ?? { categoryId: transaction.categoryId, name: transaction.category.name, color: transaction.category.color, amount: 0 };
+        category.amount += transaction.amount;
+        categoryTotals.set(transaction.categoryId, category);
+      }
+    }
+    const budgetLimit = budgets.reduce((sum, budget) => sum + budget.limitAmount, 0);
+    const budgetSpent = posted.filter((transaction) => transaction.type === TransactionType.EXPENSE && budgets.some((budget) => budget.categoryId === transaction.categoryId)).reduce((sum, transaction) => sum + transaction.amount, 0);
+    const cardOpenTotal = statements.reduce((sum, statement) => sum + Math.max(0, statement.totalAmount - statement.payments.reduce((paid, payment) => paid + payment.amount, 0)), 0);
+    const netFlow = realizedIncome - realizedExpenses;
+    const previousNetFlow = previousIncome - previousExpenses;
     return {
+      referenceMonth: referenceMonth.toISOString().slice(0, 7),
+      isForecast: referenceMonth > this.monthStart(new Date().toISOString().slice(0, 7)),
       totalBalance: accountSummaries.reduce((sum, account) => sum + account.balance, 0),
       accounts: accountSummaries,
       recentTransactions: transactions,
-      cardOpenTotal: statements.reduce((sum, statement) => sum + Math.max(0, statement.totalAmount - statement.payments.reduce((paid, payment) => paid + payment.amount, 0)), 0),
-      pendingCommitments: pendingTransactions.reduce((sum, transaction) => sum + (transaction.type === TransactionType.EXPENSE ? transaction.amount : -transaction.amount), 0),
+      cardOpenTotal,
+      pendingCommitments,
       upcomingStatements: statements,
       recurringForecast: recurringRules,
+      indicators: { availableBalance: accountSummaries.reduce((sum, account) => sum + account.balance, 0), realizedIncome, realizedExpenses, pendingCommitments, cardOpenTotal, budgetCommitted: budgetSpent + pendingCommitments },
+      comparison: { income: { current: realizedIncome, previous: previousIncome }, expenses: { current: realizedExpenses, previous: previousExpenses }, balance: { current: netFlow, previous: previousNetFlow } },
+      charts: {
+        weeklyFlow: weekly,
+        expenseByCategory: [...categoryTotals.values()].sort((a, b) => b.amount - a.amount),
+        budget: { limitAmount: budgetLimit, spentAmount: budgetSpent, pendingAmount: pendingCommitments },
+      },
     };
   }
 
@@ -603,6 +642,20 @@ export class FinanceService {
   }
 
   private transactionImpact(type: TransactionType, amount: number) { return type === TransactionType.INCOME ? -amount : amount; }
+
+  private sumByType(items: { amount: number; type: TransactionType }[], type: TransactionType) {
+    return items.filter((item) => item.type === type).reduce((sum, item) => sum + item.amount, 0);
+  }
+
+  private monthStart(value: string) {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(value)) throw new BadRequestException('Informe o mês no formato AAAA-MM.');
+    const [year, month] = value.split('-').map(Number);
+    return new Date(Date.UTC(year, month - 1, 1, 12));
+  }
+
+  private monthRange(month: Date) {
+    return { start: month, end: new Date(Date.UTC(month.getUTCFullYear(), month.getUTCMonth() + 1, 1, 12)) };
+  }
 
   private civilDate(value: string | Date) {
     const raw = typeof value === 'string' ? value.slice(0, 10) : value.toISOString().slice(0, 10);

@@ -33,6 +33,7 @@ const transactionListSchema = z.object({
   status: z.nativeEnum(TransactionStatus).optional(),
   importBatchId: z.string().cuid().optional(),
 });
+const overviewQuerySchema = z.object({ referenceMonth: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/).optional() });
 const transferSchema = z.object({ sourceAccountId: z.string().cuid(), destinationAccountId: z.string().cuid(), amount: money.positive(), occurredOn: z.string().date(), description: z.string().trim().min(2).max(160).optional(), status: z.nativeEnum(AccountTransferStatus).default(AccountTransferStatus.POSTED) }).refine((data) => data.sourceAccountId !== data.destinationAccountId, { message: 'Origem e destino devem ser diferentes.', path: ['destinationAccountId'] });
 const paymentSchema = z.object({ accountId: z.string().cuid(), amount: money.positive(), paidOn: z.string().date(), idempotencyKey: z.string().trim().min(8).max(120) });
 const installmentSchema = z.object({ cardId: z.string().cuid(), subcategoryId: z.string().cuid(), type: z.nativeEnum(TransactionType), totalAmount: money.positive(), installmentCount: z.number().int().min(2).max(120), description: z.string().trim().min(2).max(160), firstOccurredOn: z.string().date(), notes: z.string().trim().max(1000).optional() });
@@ -43,7 +44,9 @@ const recurringRuleSchema = z.object({ accountId: z.string().cuid().optional(), 
 export class FinanceController {
   constructor(private readonly finance: FinanceService) {}
 
-  @Get('overview') overview(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string) { return this.finance.overview(user.id, householdId); }
+  @Get('overview') overview(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Query() query: unknown) {
+    return this.finance.overview(user.id, householdId, overviewQuerySchema.parse(query).referenceMonth);
+  }
   @Get('accounts') listAccounts(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string) { return this.finance.listAccounts(user.id, householdId); }
   @Post('accounts') createAccount(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Body() body: unknown) { return this.finance.createAccount(user.id, householdId, accountSchema.parse(body)); }
   @Patch('accounts/:accountId') updateAccount(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('accountId') accountId: string, @Body() body: unknown) { return this.finance.updateAccount(user.id, householdId, accountId, accountUpdateSchema.parse(body)); }

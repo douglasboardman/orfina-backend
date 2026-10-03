@@ -31,6 +31,13 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
     await this.connection?.drain();
   }
 
+  health() {
+    return {
+      enabled: process.env.EVENTS_ENABLED === 'true',
+      connected: Boolean(this.jetstream),
+    };
+  }
+
   private async tick() {
     await this.ensureConnection();
     await this.flush();

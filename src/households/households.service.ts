@@ -29,6 +29,23 @@ export class HouseholdsService {
     });
   }
 
+  async rename(userId: string, householdId: string, name: string) {
+    await this.assertCanManage(userId, householdId);
+    return this.prisma.$transaction(async (tx) => {
+      const household = await tx.household.update({
+        where: { id: householdId },
+        data: { name },
+        include: { members: { where: { userId }, select: { role: true } } },
+      });
+      await this.events.record(tx, {
+        aggregateType: 'household', aggregateId: householdId,
+        eventType: 'orfina.households.household-renamed.v1',
+        payload: { householdId, name },
+      });
+      return household;
+    });
+  }
+
   async assertMember(userId: string, householdId: string) {
     const member = await this.prisma.householdMember.findUnique({ where: { householdId_userId: { householdId, userId } } });
     if (!member) throw new ForbiddenException('Você não tem acesso a este grupo familiar.');

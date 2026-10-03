@@ -7,6 +7,6 @@ import { OutboxRelay } from './outbox.relay';
 @Module({
   controllers: [EventsController],
   providers: [EventsService, OutboxRelay, PrismaService],
-  exports: [EventsService],
+  exports: [EventsService, OutboxRelay],
 })
 export class EventsModule {}

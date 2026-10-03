@@ -5,8 +5,9 @@ const cookieValue = (header: string | undefined, name: string) =>
 
 export const readCookie = (header: string | undefined, name: string) => cookieValue(header, name);
 
-export const serializeCookie = (name: string, value: string, maxAge?: number) => {
-  const attributes = [`${name}=${encodeURIComponent(value)}`, 'Path=/api', 'HttpOnly', 'SameSite=Lax'];
+export const serializeCookie = (name: string, value: string, maxAge?: number, options: { httpOnly?: boolean; path?: string } = {}) => {
+  const attributes = [`${name}=${encodeURIComponent(value)}`, `Path=${options.path ?? '/api'}`, 'SameSite=Lax'];
+  if (options.httpOnly !== false) attributes.push('HttpOnly');
   if (maxAge !== undefined) attributes.push(`Max-Age=${maxAge}`);
   if (process.env.NODE_ENV === 'production') attributes.push('Secure');
   return attributes.join('; ');

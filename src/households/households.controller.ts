@@ -15,6 +15,9 @@ const createInvitationSchema = z.object({
   email: z.string().trim().email().max(320),
   role: z.enum([HouseholdRole.MEMBER, HouseholdRole.VIEWER]).default(HouseholdRole.MEMBER),
 });
+const renameHouseholdSchema = z.object({
+  name: z.string().trim().min(2).max(80),
+});
 
 @Controller('households')
 @UseGuards(JwtAuthGuard)
@@ -30,6 +33,12 @@ export class HouseholdsController {
   create(@CurrentUser() user: AuthenticatedUser, @Body() body: unknown) {
     const dto = createHouseholdSchema.parse(body);
     return this.households.create(user.id, dto.name, dto.currency, dto.timezone);
+  }
+
+  @Patch(':householdId')
+  rename(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Body() body: unknown) {
+    const dto = renameHouseholdSchema.parse(body);
+    return this.households.rename(user.id, householdId, dto.name);
   }
 
   @Get('invitations/mine')

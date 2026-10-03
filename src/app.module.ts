@@ -7,6 +7,8 @@ import { PrismaService } from './prisma/prisma.service';
 import { EventsModule } from './events/events.module';
 import { PlanningModule } from './planning/planning.module';
 import { ImportsModule } from './imports/imports.module';
+import { VersionController } from './version.controller';
+import { HealthController } from './health.controller';
 
 @Module({
   imports: [
@@ -18,6 +20,7 @@ import { ImportsModule } from './imports/imports.module';
     PlanningModule,
     ImportsModule,
   ],
+  controllers: [VersionController, HealthController],
   providers: [PrismaService],
 })
 export class AppModule {}

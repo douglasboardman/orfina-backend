@@ -27,4 +27,20 @@ describe('HouseholdsService policies', () => {
 
     await expect(service.assertCanManage('user_1', 'household_1')).rejects.toBeInstanceOf(ForbiddenException);
   });
+
+  it('renames a household only after management authorization and records the change', async () => {
+    const update = jest.fn().mockResolvedValue({ id: 'household_1', name: 'Novo nome', members: [{ role: HouseholdRole.OWNER }] });
+    const record = jest.fn();
+    const prisma = {
+      householdMember: member,
+      household: { update },
+      $transaction: jest.fn(async (operation: (tx: unknown) => unknown) => operation({ household: { update } })),
+    };
+    const renameService = new HouseholdsService(prisma as never, { record } as never);
+    member.findUnique.mockResolvedValue({ role: HouseholdRole.OWNER });
+
+    await expect(renameService.rename('user_1', 'household_1', 'Novo nome')).resolves.toMatchObject({ name: 'Novo nome' });
+    expect(update).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'household_1' }, data: { name: 'Novo nome' } }));
+    expect(record).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ eventType: 'orfina.households.household-renamed.v1', payload: { householdId: 'household_1', name: 'Novo nome' } }));
+  });
 });
