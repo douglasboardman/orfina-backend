@@ -10,6 +10,7 @@
     "test": "jest --runInBand --testPathIgnorePatterns=integration",
     "test:integration": "node --env-file=.env ./node_modules/jest/bin/jest.js --runInBand --testRegex=.*\\.integration\\.spec\\.ts$",
     "seed:test-data": "ts-node src/scripts/seed-finance-test-data.ts",
+    "smoke:health": "node scripts/smoke-health.mjs",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev"
   },
@@ -33,6 +34,7 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@nestjs/cli": "^11.0.0",
     "@nestjs/schematics": "^11.0.0",
     "@nestjs/testing": "^11.0.1",
@@ -45,6 +47,7 @@
     "prisma": "^6.0.0",
     "ts-jest": "^29.2.5",
     "ts-node": "^10.9.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.71.0"
   }
 }
