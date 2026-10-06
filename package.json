@@ -8,7 +8,7 @@
     "start": "node dist/main",
     "lint": "eslint \"{src,test}/**/*.ts\"",
     "test": "jest --runInBand --testPathIgnorePatterns=integration",
-    "test:integration": "node --env-file=.env ./node_modules/jest/bin/jest.js --runInBand --testRegex=.*\\.integration\\.spec\\.ts$",
+    "test:integration": "node --env-file-if-exists=.env ./node_modules/jest/bin/jest.js --runInBand --testRegex=.*\\.integration\\.spec\\.ts$",
     "seed:test-data": "ts-node src/scripts/seed-finance-test-data.ts",
     "smoke:health": "node scripts/smoke-health.mjs",
     "prisma:generate": "prisma generate",
