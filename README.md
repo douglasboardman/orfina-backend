@@ -15,13 +15,14 @@ Backend da Orfina, aplicação de orçamento familiar. Implementado em NestJS, F
 
 ```bash
 cp .env.example .env
-docker compose up -d
-npm install
-npx prisma migrate deploy
-npm run start:dev
+cd ..
+docker compose up --build
 ```
 
-Configure `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_CALLBACK_URL`, `JWT_SECRET` e `FRONTEND_URL` no `.env`. Não versione esse arquivo.
+O Compose da raiz constrói a API e o frontend, aguarda o PostgreSQL, aplica as
+migrations e inicia os dois projetos. Configure `GOOGLE_CLIENT_ID`,
+`GOOGLE_CLIENT_SECRET`, `GOOGLE_CALLBACK_URL` e `JWT_SECRET` no `.env`. Não
+versione esse arquivo.
 
 ## Testes
 
