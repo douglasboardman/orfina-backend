@@ -127,8 +127,8 @@ export class ImportsService {
           await this.events.record(tx, { aggregateType: 'transfer', aggregateId: transfer.id, eventType: 'orfina.transfers.transfer-created.v1', payload: { householdId, transferId: transfer.id, status: transfer.status } });
           await this.audit(tx, householdId, userId, 'transfer', transfer.id, 'imported', ['sourceAccountId', 'destinationAccountId', 'status']);
         } else {
-          const { category, subcategory, created } = await this.categoryAndSubcategory(tx, householdId, userId, data, options.createMissingCategories);
-          const transaction = await tx.transaction.create({ data: { householdId, accountId: data.accountId, categoryId: category.id, subcategoryId: subcategory.id, type: data.type as TransactionType, amount: data.amount, description: data.description, occurredOn: this.civilDate(data.occurredOn), status: data.status as TransactionStatus, importItemId: item.id } });
+          const { subcategory, created } = await this.categoryAndSubcategory(tx, householdId, userId, data, options.createMissingCategories);
+          const transaction = await tx.transaction.create({ data: { householdId, accountId: data.accountId, subcategoryId: subcategory.id, type: data.type as TransactionType, amount: data.amount, description: data.description, occurredOn: this.civilDate(data.occurredOn), status: data.status as TransactionStatus, importItemId: item.id } });
           await this.events.record(tx, { aggregateType: 'transaction', aggregateId: transaction.id, eventType: 'orfina.imports.item-committed.v1', payload: { householdId, batchId, itemId: item.id, transactionId: transaction.id, status: transaction.status } });
           await this.audit(tx, householdId, userId, 'transaction', transaction.id, 'imported', ['accountId', 'subcategoryId', 'status']);
           if (created) await this.audit(tx, householdId, userId, 'import-item', item.id, 'created-category-on-confirmation', ['category', 'subcategory']);
@@ -163,6 +163,8 @@ export class ImportsService {
       if (!allowCreate) throw new ConflictException('Categoria ausente.');
       category = await tx.category.create({ data: { householdId, name: data.categoryName!, type: data.type as CategoryType, color: data.type === 'INCOME' ? '#16803A' : '#C2410C', icon: 'receipt_long' }, include: { subcategories: true } });
       created = true;
+      const automatic = category.subcategories.find((entry) => entry.isDefault)!;
+      await this.events.record(tx, { aggregateType: 'subcategory', aggregateId: automatic.id, eventType: 'orfina.categories.subcategory-created.v1', payload: { householdId, categoryId: category.id, subcategoryId: automatic.id, type: category.type } });
       await this.events.record(tx, { aggregateType: 'category', aggregateId: category.id, eventType: 'orfina.categories.category-created.v1', payload: { householdId, categoryId: category.id, type: category.type } });
     }
     let subcategory = category.subcategories.find((entry) => this.normalize(entry.name) === this.normalize(data.subcategoryName!));

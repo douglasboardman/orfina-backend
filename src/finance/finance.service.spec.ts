@@ -53,10 +53,10 @@ describe('FinanceService transaction rules', () => {
     households.assertMember.mockResolvedValue({ role: 'MEMBER' });
     (prisma as unknown as { account: { findFirst: jest.Mock; findMany: jest.Mock } }).account = { findFirst: jest.fn(), findMany: jest.fn().mockResolvedValue([{ initialBalance: 1000, transactions: [], cardPayments: [], outgoingTransfers: [], incomingTransfers: [] }]) };
     prisma.transaction.findMany
-      .mockResolvedValueOnce([{ id: 'recent', occurredOn: new Date('2026-04-04T12:00:00.000Z'), amount: 250, type: TransactionType.INCOME, status: 'POSTED', categoryId: 'income', category: { name: 'Salário', color: '#123456' } }])
+      .mockResolvedValueOnce([{ id: 'recent', occurredOn: new Date('2026-04-04T12:00:00.000Z'), amount: 250, type: TransactionType.INCOME, status: 'POSTED', subcategory: { categoryId: 'income', category: { name: 'Salário', color: '#123456' } } }])
       .mockResolvedValueOnce([
-        { occurredOn: new Date('2026-04-04T12:00:00.000Z'), amount: 250, type: TransactionType.INCOME, status: 'POSTED', categoryId: 'income', category: { name: 'Salário', color: '#123456' } },
-        { occurredOn: new Date('2026-04-09T12:00:00.000Z'), amount: 100, type: TransactionType.EXPENSE, status: 'PENDING', categoryId: 'food', category: { name: 'Mercado', color: '#654321' } },
+        { occurredOn: new Date('2026-04-04T12:00:00.000Z'), amount: 250, type: TransactionType.INCOME, status: 'POSTED', subcategory: { categoryId: 'income', category: { name: 'Salário', color: '#123456' } } },
+        { occurredOn: new Date('2026-04-09T12:00:00.000Z'), amount: 100, type: TransactionType.EXPENSE, status: 'PENDING', subcategory: { categoryId: 'food', category: { name: 'Mercado', color: '#654321' } } },
       ])
       .mockResolvedValueOnce([{ amount: 75, type: TransactionType.EXPENSE, status: 'POSTED' }]);
     prisma.cardStatement.findMany.mockResolvedValue([]);

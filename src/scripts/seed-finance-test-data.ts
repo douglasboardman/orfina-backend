@@ -131,7 +131,7 @@ async function accountByName(tx: Tx, householdId: string, actorId: string, name:
 async function createAccountTransaction(tx: Tx, args: { householdId: string; actorId: string; accountId: string; categoryId: string; subcategoryId: string; type: TransactionType; amount: number; description: string; occurredOn: string; notes: string }) {
   const existing = await tx.transaction.findFirst({ where: { householdId: args.householdId, notes: args.notes }, select: { id: true } });
   if (existing) return false;
-  const { actorId: _actorId, occurredOn, ...data } = args;
+  const { actorId: _actorId, categoryId: _categoryId, occurredOn, ...data } = args;
   const transaction = await tx.transaction.create({ data: { ...data, occurredOn: civilDate(occurredOn) } });
   await event(tx, 'transaction', transaction.id, 'orfina.transactions.transaction-posted.v1', { householdId: args.householdId, transactionId: transaction.id, accountId: args.accountId, categoryId: args.categoryId, type: args.type, amount: args.amount, occurredOn: transaction.occurredOn.toISOString() });
   await audit(tx, args.householdId, args.actorId, 'transaction', transaction.id, 'imported-for-test', ['accountId', 'subcategoryId', 'type', 'amount', 'occurredOn']);
@@ -158,7 +158,7 @@ async function createCardTransaction(tx: Tx, args: { householdId: string; actorI
   if (existing) return false;
   const statement = await statementForDate(tx, args.householdId, args.card, args.occurredOn);
   if (statement.status !== CardStatementStatus.OPEN) throw new Error(`A fatura ${statement.id} não está aberta para ${args.description}.`);
-  const transaction = await tx.transaction.create({ data: { householdId: args.householdId, cardId: args.card.id, statementId: statement.id, categoryId: args.categoryId, subcategoryId: args.subcategoryId, type: args.type, amount: args.amount, description: args.description, notes: args.notes, occurredOn: civilDate(args.occurredOn), installmentPurchaseId: args.installmentPurchaseId, installmentNumber: args.installmentNumber, recurringRuleId: args.recurringRuleId, recurrenceOn: args.recurrenceOn } });
+  const transaction = await tx.transaction.create({ data: { householdId: args.householdId, cardId: args.card.id, statementId: statement.id, subcategoryId: args.subcategoryId, type: args.type, amount: args.amount, description: args.description, notes: args.notes, occurredOn: civilDate(args.occurredOn), installmentPurchaseId: args.installmentPurchaseId, installmentNumber: args.installmentNumber, recurringRuleId: args.recurringRuleId, recurrenceOn: args.recurrenceOn } });
   await tx.cardStatement.update({ where: { id: statement.id }, data: { totalAmount: { increment: args.type === TransactionType.EXPENSE ? args.amount : -args.amount } } });
   await event(tx, 'transaction', transaction.id, 'orfina.transactions.transaction-posted.v1', { householdId: args.householdId, transactionId: transaction.id, cardId: args.card.id, categoryId: args.categoryId, type: args.type, amount: args.amount, occurredOn: transaction.occurredOn.toISOString() });
   await audit(tx, args.householdId, args.actorId, 'transaction', transaction.id, 'created-by-test-seed', ['cardId', 'subcategoryId', 'type', 'amount', 'occurredOn']);

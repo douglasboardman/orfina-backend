@@ -34,8 +34,8 @@ export class FinanceService {
     const previousRange = this.monthRange(previousMonth);
     const [accounts, transactions, monthTransactions, previousTransactions, statements, recurringRules, budgets] = await Promise.all([
       this.prisma.account.findMany({ where: { householdId, isActive: true }, include: { transactions: true, cardPayments: true, outgoingTransfers: true, incomingTransfers: true }, orderBy: { name: 'asc' } }),
-      this.prisma.transaction.findMany({ where: { householdId, occurredOn: { gte: start, lt: end } }, include: { category: true, subcategory: true, account: true, card: true }, orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }], take: 8 }),
-      this.prisma.transaction.findMany({ where: { householdId, occurredOn: { gte: start, lt: end } }, include: { category: true }, orderBy: { occurredOn: 'asc' } }),
+      this.prisma.transaction.findMany({ where: { householdId, occurredOn: { gte: start, lt: end } }, include: { subcategory: { include: { category: true } }, account: true, card: true }, orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }], take: 8 }),
+      this.prisma.transaction.findMany({ where: { householdId, occurredOn: { gte: start, lt: end } }, include: { subcategory: { include: { category: true } } }, orderBy: { occurredOn: 'asc' } }),
       this.prisma.transaction.findMany({ where: { householdId, occurredOn: { gte: previousRange.start, lt: previousRange.end } }, select: { amount: true, type: true, status: true } }),
       this.prisma.cardStatement.findMany({ where: { householdId, status: { not: CardStatementStatus.PAID } }, include: { card: true, payments: true }, orderBy: { dueOn: 'asc' }, take: 5 }),
       this.prisma.recurringRule.findMany({ where: { householdId, status: RecurringRuleStatus.ACTIVE }, select: { id: true, amount: true, description: true, startOn: true, endOn: true } }),
@@ -62,13 +62,13 @@ export class FinanceService {
       if (transaction.type === TransactionType.INCOME) weekly[week].income += transaction.amount;
       else {
         weekly[week].expenses += transaction.amount;
-        const category = categoryTotals.get(transaction.categoryId) ?? { categoryId: transaction.categoryId, name: transaction.category.name, color: transaction.category.color, amount: 0 };
+        const category = categoryTotals.get(transaction.subcategory.categoryId) ?? { categoryId: transaction.subcategory.categoryId, name: transaction.subcategory.category.name, color: transaction.subcategory.category.color, amount: 0 };
         category.amount += transaction.amount;
-        categoryTotals.set(transaction.categoryId, category);
+        categoryTotals.set(transaction.subcategory.categoryId, category);
       }
     }
     const budgetLimit = budgets.reduce((sum, budget) => sum + budget.limitAmount, 0);
-    const budgetSpent = posted.filter((transaction) => transaction.type === TransactionType.EXPENSE && budgets.some((budget) => budget.categoryId === transaction.categoryId)).reduce((sum, transaction) => sum + transaction.amount, 0);
+    const budgetSpent = posted.filter((transaction) => transaction.type === TransactionType.EXPENSE && budgets.some((budget) => budget.categoryId === transaction.subcategory.categoryId)).reduce((sum, transaction) => sum + transaction.amount, 0);
     const cardOpenTotal = statements.reduce((sum, statement) => sum + Math.max(0, statement.totalAmount - statement.payments.reduce((paid, payment) => paid + payment.amount, 0)), 0);
     const netFlow = realizedIncome - realizedExpenses;
     const previousNetFlow = previousIncome - previousExpenses;
@@ -201,7 +201,9 @@ export class FinanceService {
   async createCategory(userId: string, householdId: string, dto: CreateCategory) {
     await this.households.assertCanManage(userId, householdId);
     return this.prisma.$transaction(async (tx) => {
-      const category = await tx.category.create({ data: { householdId, ...dto } });
+      const category = await tx.category.create({ data: { householdId, ...dto }, include: { subcategories: true } });
+      const subcategory = category.subcategories.find((item) => item.isDefault)!;
+      await this.events.record(tx, { aggregateType: 'subcategory', aggregateId: subcategory.id, eventType: 'orfina.categories.subcategory-created.v1', payload: { householdId, categoryId: category.id, subcategoryId: subcategory.id, type: category.type } });
       await this.events.record(tx, {
         aggregateType: 'category', aggregateId: category.id,
         eventType: 'orfina.categories.category-created.v1',
@@ -216,7 +218,11 @@ export class FinanceService {
     const category = await this.prisma.category.findFirst({ where: { id: categoryId, householdId } });
     if (!category) throw new NotFoundException('Categoria não encontrada neste grupo familiar.');
     return this.prisma.$transaction(async (tx) => {
-      const updated = await tx.category.update({ where: { id: categoryId }, data: dto });
+      const updated = await tx.category.update({ where: { id: categoryId }, data: dto, include: { subcategories: true } });
+      if (dto.name && dto.name !== category.name) {
+        const subcategory = updated.subcategories.find((item) => item.isDefault)!;
+        await this.events.record(tx, { aggregateType: 'subcategory', aggregateId: subcategory.id, eventType: 'orfina.categories.subcategory-updated.v1', payload: { householdId, categoryId, subcategoryId: subcategory.id } });
+      }
       await this.events.record(tx, {
         aggregateType: 'category', aggregateId: categoryId,
         eventType: 'orfina.categories.category-updated.v1',
@@ -245,6 +251,7 @@ export class FinanceService {
     await this.households.assertCanManage(userId, householdId);
     const category = await this.prisma.category.findFirst({ where: { id: categoryId, householdId, isActive: true } });
     if (!category) throw new NotFoundException('Categoria não encontrada neste grupo familiar.');
+    if (dto.name === category.name) throw new BadRequestException('A subcategoria com o nome da categoria já existe automaticamente.');
 
     return this.prisma.$transaction(async (tx) => {
       const subcategory = await tx.subcategory.create({ data: { categoryId, ...dto } });
@@ -259,8 +266,10 @@ export class FinanceService {
 
   async updateSubcategory(userId: string, householdId: string, subcategoryId: string, dto: CreateSubcategory) {
     await this.households.assertCanManage(userId, householdId);
-    const subcategory = await this.prisma.subcategory.findFirst({ where: { id: subcategoryId, category: { householdId } } });
+    const subcategory = await this.prisma.subcategory.findFirst({ where: { id: subcategoryId, category: { householdId } }, include: { category: true } });
     if (!subcategory) throw new NotFoundException('Subcategoria não encontrada neste grupo familiar.');
+    if (subcategory.isDefault) throw new BadRequestException('A subcategoria automática é gerenciada pela categoria.');
+    if (dto.name === subcategory.category.name) throw new BadRequestException('Este nome pertence à subcategoria automática.');
     return this.prisma.$transaction(async (tx) => {
       const updated = await tx.subcategory.update({ where: { id: subcategoryId }, data: dto });
       await this.events.record(tx, {
@@ -274,8 +283,9 @@ export class FinanceService {
 
   async setSubcategoryStatus(userId: string, householdId: string, subcategoryId: string, isActive: boolean) {
     await this.households.assertCanManage(userId, householdId);
-    const subcategory = await this.prisma.subcategory.findFirst({ where: { id: subcategoryId, category: { householdId } } });
+    const subcategory = await this.prisma.subcategory.findFirst({ where: { id: subcategoryId, category: { householdId } }, include: { category: true } });
     if (!subcategory) throw new NotFoundException('Subcategoria não encontrada neste grupo familiar.');
+    if (subcategory.isDefault) throw new BadRequestException('A subcategoria automática é gerenciada pela categoria.');
     return this.prisma.$transaction(async (tx) => {
       const updated = await tx.subcategory.update({ where: { id: subcategoryId }, data: { isActive } });
       await this.events.record(tx, {
@@ -295,7 +305,7 @@ export class FinanceService {
       cardId: filters.cardId,
       statementId: filters.statementId,
       recurringRuleId: filters.recurringRuleId,
-      categoryId: filters.categoryId,
+      subcategory: filters.categoryId ? { categoryId: filters.categoryId } : undefined,
       subcategoryId: filters.subcategoryId,
       type: filters.type,
       status: filters.status,
@@ -309,7 +319,7 @@ export class FinanceService {
     }
     const [items, total] = await this.prisma.$transaction([
       this.prisma.transaction.findMany({
-        where, include: { account: true, card: true, category: true, subcategory: true },
+        where, include: { account: true, card: true, subcategory: { include: { category: true } } },
         orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }],
         skip: (filters.page - 1) * filters.pageSize,
         take: filters.pageSize,
@@ -337,14 +347,14 @@ export class FinanceService {
       const statement = card ? await this.statementForDate(tx, card, householdId, dto.occurredOn) : undefined;
       if (statement && statement.status !== CardStatementStatus.OPEN) throw new BadRequestException('Não é possível alterar uma fatura fechada ou paga. Registre um ajuste rastreável.');
       const transaction = await tx.transaction.create({
-        data: { householdId, ...dto, statementId: statement?.id, categoryId: subcategory.categoryId, occurredOn: this.civilDate(dto.occurredOn) },
-        include: { account: true, card: true, category: true, subcategory: true },
+        data: { householdId, ...dto, statementId: statement?.id, occurredOn: this.civilDate(dto.occurredOn) },
+        include: { account: true, card: true, subcategory: { include: { category: true } } },
       });
       if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
       await this.events.record(tx, {
         aggregateType: 'transaction', aggregateId: transaction.id,
         eventType: `orfina.transactions.transaction-${transaction.status === TransactionStatus.PENDING ? 'pending' : 'posted'}.v1`,
-        payload: { transactionId: transaction.id, householdId, accountId: transaction.accountId, cardId: transaction.cardId, categoryId: transaction.categoryId, type: transaction.type, status: transaction.status },
+        payload: { transactionId: transaction.id, householdId, accountId: transaction.accountId, cardId: transaction.cardId, categoryId: transaction.subcategory.categoryId, type: transaction.type, status: transaction.status },
       });
       await this.audit(tx, householdId, userId, 'transaction', transaction.id, 'created', ['accountId', 'cardId', 'subcategoryId', 'type', 'amount', 'occurredOn']);
       return transaction;
@@ -379,15 +389,14 @@ export class FinanceService {
         data: {
           ...dto,
           statementId: statement?.id ?? null,
-          categoryId: subcategory.categoryId,
           occurredOn: this.civilDate(dto.occurredOn),
         },
-        include: { account: true, card: true, category: true, subcategory: true },
+        include: { account: true, card: true, subcategory: { include: { category: true } } },
       });
       await this.events.record(tx, {
         aggregateType: 'transaction', aggregateId: transactionId,
         eventType: 'orfina.transactions.transaction-updated.v1',
-        payload: { transactionId, householdId, accountId: transaction.accountId, cardId: transaction.cardId, categoryId: transaction.categoryId, subcategoryId: transaction.subcategoryId, type: transaction.type, amount: transaction.amount, occurredOn: transaction.occurredOn.toISOString() },
+        payload: { transactionId, householdId, accountId: transaction.accountId, cardId: transaction.cardId, categoryId: transaction.subcategory.categoryId, subcategoryId: transaction.subcategoryId, type: transaction.type, amount: transaction.amount, occurredOn: transaction.occurredOn.toISOString() },
       });
       if (existing.statementId) await this.adjustStatementTotal(tx, existing.statementId, -this.transactionImpact(existing.type, existing.amount));
       if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
@@ -398,7 +407,7 @@ export class FinanceService {
 
   async deleteTransaction(userId: string, householdId: string, transactionId: string) {
     await this.households.assertCanWrite(userId, householdId);
-    const transaction = await this.prisma.transaction.findFirst({ where: { id: transactionId, householdId } });
+    const transaction = await this.prisma.transaction.findFirst({ where: { id: transactionId, householdId }, include: { subcategory: true } });
     if (!transaction) throw new NotFoundException('Lançamento não encontrado neste grupo familiar.');
     return this.prisma.$transaction(async (tx) => {
       if (transaction.statementId) {
@@ -410,7 +419,7 @@ export class FinanceService {
       await this.events.record(tx, {
         aggregateType: 'transaction', aggregateId: transactionId,
         eventType: 'orfina.transactions.transaction-deleted.v1',
-        payload: { transactionId, householdId, accountId: transaction.accountId, cardId: transaction.cardId, categoryId: transaction.categoryId, subcategoryId: transaction.subcategoryId },
+        payload: { transactionId, householdId, accountId: transaction.accountId, cardId: transaction.cardId, categoryId: transaction.subcategory.categoryId, subcategoryId: transaction.subcategoryId },
       });
       await this.audit(tx, householdId, userId, 'transaction', transactionId, 'deleted', ['accountId', 'cardId', 'subcategoryId', 'type', 'amount']);
       return { id: transactionId, deleted: true };
@@ -423,7 +432,7 @@ export class FinanceService {
     if (!transaction) throw new NotFoundException('Lançamento não encontrado neste grupo familiar.');
     if (transaction.statementId) throw new BadRequestException('A situação de lançamento de cartão é controlada pela fatura.');
     return this.prisma.$transaction(async (tx) => {
-      const updated = await tx.transaction.update({ where: { id: transactionId }, data: { status } });
+      const updated = await tx.transaction.update({ where: { id: transactionId }, data: { status }, include: { account: true, card: true, subcategory: { include: { category: true } } } });
       await this.events.record(tx, { aggregateType: 'transaction', aggregateId: transactionId, eventType: 'orfina.transactions.status-changed.v1', payload: { householdId, transactionId, status } });
       await this.audit(tx, householdId, userId, 'transaction', transactionId, 'status-changed', ['status']);
       return updated;
@@ -526,7 +535,7 @@ export class FinanceService {
         const statement = await this.statementForDate(tx, card, householdId, occurredOn);
         if (statement.status !== CardStatementStatus.OPEN) throw new BadRequestException('Uma parcela cairia em uma fatura já fechada; escolha uma data inicial posterior.');
         const amount = installments[index];
-        const transaction = await tx.transaction.create({ data: { householdId, cardId: card.id, statementId: statement.id, installmentPurchaseId: purchase.id, installmentNumber: index + 1, categoryId: subcategory.categoryId, subcategoryId: subcategory.id, type: dto.type, amount, description: `${dto.description} (${index + 1}/${dto.installmentCount})`, notes: dto.notes, occurredOn: this.civilDate(occurredOn) } });
+        const transaction = await tx.transaction.create({ data: { householdId, cardId: card.id, statementId: statement.id, installmentPurchaseId: purchase.id, installmentNumber: index + 1, subcategoryId: subcategory.id, type: dto.type, amount, description: `${dto.description} (${index + 1}/${dto.installmentCount})`, notes: dto.notes, occurredOn: this.civilDate(occurredOn) } });
         await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
       }
       await this.events.record(tx, { aggregateType: 'installment-purchase', aggregateId: purchase.id, eventType: 'orfina.installments.purchase-created.v1', payload: { purchaseId: purchase.id, householdId, cardId: card.id, totalAmount: dto.totalAmount, installmentCount: dto.installmentCount } });
@@ -610,7 +619,7 @@ export class FinanceService {
           if (existing) return false;
           const statement = rule.card ? await this.statementForDate(tx, rule.card, rule.householdId, occurredOn) : undefined;
           if (statement && statement.status !== CardStatementStatus.OPEN) return false;
-          const transaction = await tx.transaction.create({ data: { householdId: rule.householdId, accountId: rule.accountId, cardId: rule.cardId, statementId: statement?.id, recurringRuleId: rule.id, recurrenceOn: occurredOn, categoryId: rule.categoryId, subcategoryId: rule.subcategoryId, type: rule.type, amount: rule.amount, description: rule.description, notes: rule.notes, occurredOn } });
+          const transaction = await tx.transaction.create({ data: { householdId: rule.householdId, accountId: rule.accountId, cardId: rule.cardId, statementId: statement?.id, recurringRuleId: rule.id, recurrenceOn: occurredOn, subcategoryId: rule.subcategoryId, type: rule.type, amount: rule.amount, description: rule.description, notes: rule.notes, occurredOn } });
           if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
           await this.events.record(tx, { aggregateType: 'recurring-occurrence', aggregateId: transaction.id, eventType: 'orfina.recurring.occurrence-created.v1', payload: { ruleId: rule.id, transactionId: transaction.id, householdId: rule.householdId, occurredOn: occurredOn.toISOString() } });
           await this.audit(tx, rule.householdId, null, 'recurring-occurrence', transaction.id, 'created', ['recurringRuleId', 'occurredOn']);

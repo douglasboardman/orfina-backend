@@ -18,16 +18,26 @@ export class PlanningService {
     const { start, end } = this.monthRange(referenceMonth);
     const [budgets, categorySpend, categoryPending, categories, budgetMonth, recurringRules, installments, cards] = await Promise.all([
       this.prisma.monthlyBudget.findMany({ where: { householdId, referenceMonth }, include: { category: true }, orderBy: { category: { name: 'asc' } } }),
-      this.prisma.transaction.groupBy({ by: ['categoryId'], where: { householdId, type: 'EXPENSE', status: 'POSTED', occurredOn: { gte: start, lt: end } }, _sum: { amount: true } }),
-      this.prisma.transaction.groupBy({ by: ['categoryId'], where: { householdId, type: 'EXPENSE', status: 'PENDING', occurredOn: { gte: start, lt: end } }, _sum: { amount: true } }),
+      this.prisma.transaction.groupBy({ by: ['subcategoryId'], where: { householdId, type: 'EXPENSE', status: 'POSTED', occurredOn: { gte: start, lt: end } }, _sum: { amount: true } }),
+      this.prisma.transaction.groupBy({ by: ['subcategoryId'], where: { householdId, type: 'EXPENSE', status: 'PENDING', occurredOn: { gte: start, lt: end } }, _sum: { amount: true } }),
       this.prisma.category.findMany({ where: { householdId, type: 'EXPENSE' }, orderBy: { name: 'asc' } }),
       this.prisma.budgetMonth.findUnique({ where: { householdId_referenceMonth: { householdId, referenceMonth } } }),
       this.prisma.recurringRule.findMany({ where: { householdId, status: 'ACTIVE', startOn: { lt: end }, OR: [{ endOn: null }, { endOn: { gte: start } }] } }),
       this.prisma.installmentPurchase.findMany({ where: { householdId, canceledAt: null }, include: { transactions: { where: { occurredOn: { gte: start, lt: end } } } } }),
       this.prisma.cardStatement.findMany({ where: { householdId, status: { not: 'PAID' } }, include: { payments: true } }),
     ]);
-    const spendByCategory = new Map(categorySpend.map((item) => [item.categoryId, item._sum.amount ?? 0]));
-    const pendingByCategory = new Map(categoryPending.map((item) => [item.categoryId, item._sum.amount ?? 0]));
+    const subcategories = await this.prisma.subcategory.findMany({ where: { category: { householdId } }, select: { id: true, categoryId: true } });
+    const parentBySubcategory = new Map(subcategories.map((item) => [item.id, item.categoryId]));
+    const aggregateByCategory = (items: { subcategoryId: string; _sum: { amount: number | null } }[]) => {
+      const totals = new Map<string, number>();
+      for (const item of items) {
+        const categoryId = parentBySubcategory.get(item.subcategoryId);
+        if (categoryId) totals.set(categoryId, (totals.get(categoryId) ?? 0) + (item._sum.amount ?? 0));
+      }
+      return totals;
+    };
+    const spendByCategory = aggregateByCategory(categorySpend);
+    const pendingByCategory = aggregateByCategory(categoryPending);
     const rows = budgets.map((budget) => ({
       ...budget,
       spentAmount: spendByCategory.get(budget.categoryId) ?? 0,

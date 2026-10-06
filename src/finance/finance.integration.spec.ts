@@ -1,4 +1,4 @@
-import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { CardNetwork, PrismaClient, TransactionType } from '@prisma/client';
 import { EventsService } from '../events/events.service';
 import { HouseholdsService } from '../households/households.service';
@@ -57,10 +57,95 @@ integration('Finance integration (PostgreSQL)', () => {
       occurredOn: '2026-10-02',
     });
 
-    expect(transaction.categoryId).toBe(category.id);
+    expect(transaction.subcategory.categoryId).toBe(category.id);
     expect(transaction.subcategoryId).toBe(subcategory.id);
+    expect(transaction).not.toHaveProperty('categoryId');
+    expect(transaction).not.toHaveProperty('category');
     await expect(finance.listTransactions(outsiderId, householdId, { page: 1, pageSize: 20 })).rejects.toBeInstanceOf(ForbiddenException);
-    await expect(prisma.transaction.create({ data: { householdId, accountId: account.id, categoryId: category.id, type: TransactionType.EXPENSE, amount: 100, description: 'Sem subcategoria', occurredOn: new Date() } } as never)).rejects.toThrow();
+    await expect(prisma.transaction.create({ data: { householdId, accountId: account.id, type: TransactionType.EXPENSE, amount: 100, description: 'Sem subcategoria', occurredOn: new Date() } } as never)).rejects.toThrow();
+  });
+
+  it('creates exactly one automatic subcategory and protects its name and active status', async () => {
+    const category = await finance.createCategory(ownerId, householdId, { name: 'Automática original', type: 'EXPENSE', color: '#123456' });
+    const [automatic] = category.subcategories;
+    expect(automatic).toMatchObject({ name: category.name, isDefault: true, isActive: true });
+    await expect(finance.createSubcategory(ownerId, householdId, category.id, { name: category.name })).rejects.toBeInstanceOf(BadRequestException);
+    await expect(prisma.subcategory.create({ data: { categoryId: category.id, name: category.name } })).rejects.toThrow();
+    await expect(finance.updateSubcategory(ownerId, householdId, automatic.id, { name: 'Outro nome' })).rejects.toBeInstanceOf(BadRequestException);
+    await expect(finance.setSubcategoryStatus(ownerId, householdId, automatic.id, false)).rejects.toBeInstanceOf(BadRequestException);
+    await expect(prisma.subcategory.update({ where: { id: automatic.id }, data: { name: 'Outro nome' } })).rejects.toThrow();
+    await expect(prisma.subcategory.delete({ where: { id: automatic.id } })).rejects.toThrow();
+    const renamed = await finance.updateCategory(ownerId, householdId, category.id, { name: 'Automática renomeada' });
+    expect(renamed.subcategories).toEqual([expect.objectContaining({ id: automatic.id, name: renamed.name, isDefault: true })]);
+    await finance.setCategoryStatus(ownerId, householdId, category.id, false);
+    await finance.setCategoryStatus(ownerId, householdId, category.id, true);
+    expect(await prisma.subcategory.findUnique({ where: { id: automatic.id } })).toMatchObject({ isDefault: true, isActive: true });
+    // Imports and seeds also use direct Prisma creation; the database enforces the invariant.
+    const direct = await prisma.category.create({ data: { householdId, name: 'Categoria direta', type: 'INCOME' }, include: { subcategories: true } });
+    expect(direct.subcategories).toEqual([expect.objectContaining({ name: direct.name, isDefault: true })]);
+    await Promise.all(['Direta A', 'Direta B'].map((name) => prisma.category.update({ where: { id: direct.id }, data: { name } })));
+    const final = await prisma.category.findUniqueOrThrow({ where: { id: direct.id }, include: { subcategories: true } });
+    expect(final.subcategories).toEqual([expect.objectContaining({ name: final.name, isDefault: true })]);
+  });
+
+  it('merges a rename collision preserving transactions, installments, recurrence and category totals', async () => {
+    const category = await finance.createCategory(ownerId, householdId, { name: 'Antes da união', type: 'EXPENSE', color: '#123456' });
+    const automatic = category.subcategories[0];
+    const duplicate = await finance.createSubcategory(ownerId, householdId, category.id, { name: 'Depois da união' });
+    const specific = await finance.createSubcategory(ownerId, householdId, category.id, { name: 'Específica preservada' });
+    const account = await finance.createAccount(ownerId, householdId, { name: 'Conta união', type: 'CHECKING', initialBalance: 0 });
+    const card = await finance.createCard(ownerId, householdId, { name: 'Cartão união', network: CardNetwork.VISA });
+    const movement = await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: duplicate.id, type: TransactionType.EXPENSE, amount: 750, description: 'Lançamento preservado', occurredOn: '2026-10-04' });
+    await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: automatic.id, type: TransactionType.EXPENSE, amount: 250, description: 'Outro lançamento', occurredOn: '2026-10-04' });
+    await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: specific.id, type: TransactionType.EXPENSE, amount: 125, description: 'Outra subcategoria', occurredOn: '2026-10-04' });
+    await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: specific.id, type: TransactionType.EXPENSE, amount: 75, description: 'Pendente preservado', occurredOn: '2026-10-04', status: 'PENDING' });
+    const purchase = await finance.createInstallmentPurchase(ownerId, householdId, { cardId: card.id, subcategoryId: duplicate.id, type: TransactionType.EXPENSE, totalAmount: 600, installmentCount: 2, description: 'Parcelada preservada', firstOccurredOn: '2026-12-04' });
+    const rule = await finance.createRecurringRule(ownerId, householdId, { accountId: account.id, subcategoryId: duplicate.id, type: TransactionType.EXPENSE, amount: 100, description: 'Recorrência preservada', startOn: '2026-12-04' });
+    await finance.updateCategory(ownerId, householdId, category.id, { name: duplicate.name });
+    expect(await prisma.subcategory.findUnique({ where: { id: duplicate.id } })).toBeNull();
+    expect(await prisma.subcategory.findUnique({ where: { id: automatic.id } })).toMatchObject({ name: duplicate.name, isDefault: true });
+    expect(await prisma.transaction.findUnique({ where: { id: movement.id } })).toMatchObject({ subcategoryId: automatic.id, amount: 750 });
+    expect(await prisma.installmentPurchase.findUnique({ where: { id: purchase.id } })).toMatchObject({ subcategoryId: automatic.id });
+    expect(await prisma.recurringRule.findUnique({ where: { id: rule.id } })).toMatchObject({ subcategoryId: automatic.id });
+    expect((await finance.listRecurringRules(ownerId, householdId)).find((item) => item.id === rule.id)?.category.id).toBe(category.id);
+    expect(await prisma.transaction.count({ where: { installmentPurchaseId: purchase.id, subcategoryId: automatic.id } })).toBe(2);
+    const filtered = await finance.listTransactions(ownerId, householdId, { page: 1, pageSize: 100, categoryId: category.id, from: '2026-10-01', to: '2026-10-31' });
+    expect(filtered.total).toBe(4);
+    expect(filtered.items.every((item) => item.subcategory.category.id === category.id)).toBe(true);
+    await planning.upsertBudget(ownerId, householdId, '2026-10', { categoryId: category.id, limitAmount: 2_000 });
+    expect((await planning.budgetSummary(ownerId, householdId, '2026-10')).rows.find((item) => item.categoryId === category.id)).toMatchObject({ spentAmount: 1_125, pendingAmount: 75 });
+    expect((await finance.overview(ownerId, householdId, '2026-10')).charts.expenseByCategory.find((item) => item.categoryId === category.id)?.amount).toBe(1_125);
+  });
+
+  it('rejects foreign household accounts and subcategories on creation and editing', async () => {
+    const foreign = await prisma.household.create({ data: { name: 'Grupo isolado', members: { create: { userId: ownerId, role: 'OWNER' } } } });
+    try {
+      const account = await finance.createAccount(ownerId, householdId, { name: 'Conta isolamento', type: 'CHECKING', initialBalance: 0 });
+      const category = await finance.createCategory(ownerId, householdId, { name: 'Categoria isolamento', type: 'EXPENSE', color: '#123456' });
+      const foreignCategory = await finance.createCategory(ownerId, foreign.id, { name: 'Categoria estrangeira', type: 'EXPENSE', color: '#123456' });
+      const foreignAccount = await finance.createAccount(ownerId, foreign.id, { name: 'Conta estrangeira', type: 'CHECKING', initialBalance: 0 });
+      const dto = { accountId: account.id, subcategoryId: category.subcategories[0].id, type: TransactionType.EXPENSE, amount: 100, description: 'Isolamento', occurredOn: '2026-10-04' };
+      const movement = await finance.createTransaction(ownerId, householdId, dto);
+      for (const invalid of [{ ...dto, accountId: foreignAccount.id }, { ...dto, subcategoryId: foreignCategory.subcategories[0].id }]) {
+        await expect(finance.createTransaction(ownerId, householdId, invalid)).rejects.toBeInstanceOf(NotFoundException);
+        await expect(finance.updateTransaction(ownerId, householdId, movement.id, invalid)).rejects.toBeInstanceOf(NotFoundException);
+      }
+      await expect(finance.updateCategory(outsiderId, householdId, category.id, { name: 'Inválido' })).rejects.toBeInstanceOf(ForbiddenException);
+    } finally {
+      await prisma.outboxEvent.deleteMany({ where: { payload: { path: ['householdId'], equals: foreign.id } } });
+      await prisma.household.delete({ where: { id: foreign.id } });
+    }
+  });
+
+  it('creates the automatic subcategory when importing a new category and uses it without duplication', async () => {
+    const account = await finance.createAccount(ownerId, householdId, { name: 'Conta nova importação', type: 'CHECKING', initialBalance: 0 });
+    const csv = 'Data;Descrição;Valor;Tipo;Categoria;Subcategoria\n2026-10-03;Importação automática;-1,00;Despesa;Importada automática;Importada automática\n';
+    const preview = await imports.preview(ownerId, householdId, { fileName: 'automatica.csv', contentBase64: Buffer.from(csv).toString('base64'), mapping: {}, accountId: account.id });
+    await imports.commit(ownerId, householdId, preview.id, { createMissingCategories: true });
+    const category = await prisma.category.findUniqueOrThrow({ where: { householdId_name_type: { householdId, name: 'Importada automática', type: 'EXPENSE' } }, include: { subcategories: true } });
+    expect(category.subcategories).toEqual([expect.objectContaining({ name: category.name, isDefault: true })]);
+    const [movement] = (await finance.listTransactions(ownerId, householdId, { page: 1, pageSize: 100, importBatchId: preview.id })).items;
+    expect(movement.subcategoryId).toBe(category.subcategories[0].id);
   });
 
   it('accepts an income transaction funded by a card and rejects a transaction without a funding source', async () => {
@@ -70,7 +155,7 @@ integration('Finance integration (PostgreSQL)', () => {
     const transaction = await finance.createTransaction(ownerId, householdId, { cardId: card.id, subcategoryId: subcategory.id, type: TransactionType.INCOME, amount: 500, description: 'Cashback', occurredOn: '2026-10-02' });
     expect(transaction.cardId).toBe(card.id);
     expect(transaction.accountId).toBeNull();
-    await expect(prisma.transaction.create({ data: { householdId, categoryId: category.id, subcategoryId: subcategory.id, type: TransactionType.INCOME, amount: 100, description: 'Sem origem', occurredOn: new Date() } } as never)).rejects.toThrow();
+    await expect(prisma.transaction.create({ data: { householdId, subcategoryId: subcategory.id, type: TransactionType.INCOME, amount: 100, description: 'Sem origem', occurredOn: new Date() } } as never)).rejects.toThrow();
   });
 
   it('keeps a card statement isolated, settles it idempotently from a household account and materializes recurrence once', async () => {
