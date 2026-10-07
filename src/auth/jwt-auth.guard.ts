@@ -1,16 +1,11 @@
-import { ExecutionContext, Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
-import { readCookie } from './auth-cookie';
-
+import { identityError } from '../identity/identity-policy';
 @Injectable()
 export class JwtAuthGuard extends AuthGuard('jwt') {
-  private readonly logger = new Logger(JwtAuthGuard.name);
-
-  handleRequest<TUser = unknown>(err: Error | null, user: TUser | false | null, info: { name?: string } | undefined, context: ExecutionContext): TUser {
-    if (!user || err) {
-      const request = context.switchToHttp().getRequest<{ url: string; headers: { cookie?: string } }>();
-      this.logger.warn(`Sessão rejeitada em ${request.url}; cookie de sessão recebido: ${Boolean(readCookie(request.headers.cookie, 'orfina_session'))}; motivo: ${info?.name ?? err?.name ?? 'ausente'}.`);
-    }
-    return super.handleRequest(err, user, info, context) as TUser;
+  handleRequest<TUser = unknown>(err: Error | null, user: TUser | false | null): TUser {
+    if (err) throw err;
+    if (!user) identityError(401, 'SESSION_INVALID', 'Sessão inválida ou acesso restrito.');
+    return user;
   }
 }

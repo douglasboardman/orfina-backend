@@ -106,6 +106,53 @@ enum HouseholdInvitationStatus {
   EXPIRED
 }
 
+enum SystemRole {
+  USER
+  SYSTEM_ADMIN
+}
+
+enum AccessStatus {
+  ENABLED
+  DISABLED
+}
+
+enum AccessSource {
+  MANUAL
+  BOOTSTRAP
+}
+
+model AccessGrant {
+  id              String       @id @default(cuid())
+  email           String
+  normalizedEmail String       @unique
+  userId          String?      @unique
+  status          AccessStatus @default(ENABLED)
+  source          AccessSource @default(MANUAL)
+  reason          String?
+  version         Int          @default(1)
+  createdById     String?
+  updatedById     String?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  user            User?        @relation(fields: [userId], references: [id], onDelete: Restrict)
+  @@index([status, createdAt, id])
+}
+
+model SystemAuditLog {
+  id           String   @id @default(cuid())
+  actorUserId  String?
+  actorType    String
+  action       String
+  targetType   String
+  targetId     String
+  changes      Json
+  reason       String?
+  requestId    String?
+  createdAt    DateTime @default(now())
+  @@index([createdAt, id])
+  @@index([targetId, createdAt])
+}
+
 model User {
   id           String            @id @default(cuid())
   email        String            @unique
@@ -116,6 +163,9 @@ model User {
   updatedAt    DateTime          @updatedAt
   memberships  HouseholdMember[]
   sessions     Session[]
+  systemRole   SystemRole        @default(USER)
+  lastLoginAt  DateTime?
+  accessGrant  AccessGrant?
 }
 
 model Session {
@@ -123,6 +173,7 @@ model Session {
   userId    String
   expiresAt DateTime
   revokedAt DateTime?
+  csrfTokenHash String?
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)

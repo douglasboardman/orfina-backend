@@ -1,3 +1,5 @@
+import { validateEnvironment } from './production-config';
+import { IdentityModule } from './identity/identity.module';
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AuthModule } from './auth/auth.module';
@@ -12,8 +14,9 @@ import { HealthController } from './health.controller';
 
 @Module({
   imports: [
-    ConfigModule.forRoot({ isGlobal: true }),
+    ConfigModule.forRoot({ isGlobal: true, validate: validateEnvironment }),
     AuthModule,
+    IdentityModule,
     HouseholdsModule,
     FinanceModule,
     EventsModule,

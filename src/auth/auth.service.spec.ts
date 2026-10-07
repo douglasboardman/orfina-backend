@@ -1,42 +1,43 @@
-import { AuthService } from './auth.service';
+import { AuthService, hashCsrf } from './auth.service';
 
-describe('AuthService revocable sessions', () => {
-  const prisma = {
-    user: { upsert: jest.fn(), findUniqueOrThrow: jest.fn() },
+describe('AuthService access gate', () => {
+  const tx = {
+    $executeRaw: jest.fn(), accessGrant: { findUnique: jest.fn() },
     session: { create: jest.fn(), updateMany: jest.fn(), findFirst: jest.fn() },
   };
-  const jwt = { sign: jest.fn().mockReturnValue('signed-token') };
+  const prisma = { ...tx, $transaction: jest.fn((fn: (value: typeof tx) => unknown) => fn(tx)) };
+  const jwt = { sign: jest.fn().mockReturnValue('signed-token'), verify: jest.fn() };
   const service = new AuthService(prisma as never, jwt as never);
-
-  beforeEach(() => jest.clearAllMocks());
-
-  it('creates a persisted session and embeds only its id in the signed token', async () => {
-    prisma.session.create.mockResolvedValue({ id: 'session_1', userId: 'user_1', expiresAt: new Date('2026-10-10') });
-
-    const result = await service.createSession({ id: 'user_1', email: 'person@example.test', name: 'Person' } as never);
-
-    expect(result.token).toBe('signed-token');
-    expect(jwt.sign).toHaveBeenCalledWith(expect.objectContaining({ sub: 'user_1', sid: 'session_1' }));
-    expect(prisma.session.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ userId: 'user_1' }) }));
+  beforeEach(() => { jest.clearAllMocks(); tx.accessGrant.findUnique.mockResolvedValue({ status: 'ENABLED' }); });
+  it('creates a session-bound proof and keeps profile/role out of JWT', async () => {
+    tx.session.create.mockResolvedValue({ id: 'session_1' });
+    const result = await service.createSession({ id: 'user_1' } as never);
+    expect(result.csrf).toHaveLength(64);
+    expect(tx.session.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ csrfTokenHash: hashCsrf(result.csrf) }) }));
+    expect(jwt.sign).toHaveBeenCalledWith({ sub: 'user_1', sid: 'session_1' });
   });
-
-  it('accepts only a non-revoked and non-expired persisted session', async () => {
-    prisma.session.findFirst.mockResolvedValueOnce({ id: 'session_1' }).mockResolvedValueOnce(null);
-
-    await expect(service.isSessionActive('session_1', 'user_1')).resolves.toBe(true);
+  it('refuses disabled access before issuing a session', async () => {
+    tx.accessGrant.findUnique.mockResolvedValue({ status: 'DISABLED' });
+    await expect(service.createSession({ id: 'user_1' } as never)).rejects.toMatchObject({ status: 403 });
+    expect(tx.session.create).not.toHaveBeenCalled();
+  });
+  it('denies missing grants and propagates database failures without granting access', async () => {
+    tx.accessGrant.findUnique.mockResolvedValue(null);
+    await expect(service.createSession({ id: 'user_1' } as never)).rejects.toMatchObject({ status: 403 });
+    tx.session.findFirst.mockRejectedValueOnce(new Error('database unavailable'));
+    await expect(service.isSessionActive('sid', 'uid')).rejects.toThrow('database unavailable');
+    expect(tx.session.create).not.toHaveBeenCalled();
+  });
+  it('requires a live grant for every session lookup', async () => {
+    tx.session.findFirst.mockResolvedValue(null);
     await expect(service.isSessionActive('session_1', 'user_1')).resolves.toBe(false);
-    expect(prisma.session.findFirst).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({ id: 'session_1', userId: 'user_1', revokedAt: null, expiresAt: { gt: expect.any(Date) } }),
-    }));
+    expect(tx.session.findFirst).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({
+      user: { accessGrant: { is: { status: 'ENABLED' } } }, revokedAt: null,
+    }) }));
   });
-
-  it('revokes the old session before rotation', async () => {
-    prisma.session.updateMany.mockResolvedValue({ count: 1 });
-    prisma.session.create.mockResolvedValue({ id: 'session_2', userId: 'user_1', expiresAt: new Date('2026-10-10') });
-
-    await service.rotateSession({ id: 'user_1', email: 'person@example.test', name: 'Person' } as never, 'session_1');
-
-    expect(prisma.session.updateMany).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'session_1', userId: 'user_1', revokedAt: null } }));
-    expect(jwt.sign).toHaveBeenCalledWith(expect.objectContaining({ sid: 'session_2' }));
+  it('rejects reuse of a revoked rotation and never issues its replacement', async () => {
+    tx.session.updateMany.mockResolvedValue({ count: 0 });
+    await expect(service.rotateSession({ id: 'user_1' } as never, 'old')).rejects.toMatchObject({ status: 401 });
+    expect(tx.session.create).not.toHaveBeenCalled();
   });
 });

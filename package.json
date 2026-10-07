@@ -12,7 +12,10 @@
     "seed:test-data": "ts-node src/scripts/seed-finance-test-data.ts",
     "smoke:health": "node scripts/smoke-health.mjs",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate dev"
+    "prisma:migrate": "prisma migrate dev",
+    "admin:bootstrap": "node --env-file-if-exists=.env -r ts-node/register src/scripts/admin.ts bootstrap",
+    "admin:operate": "node --env-file-if-exists=.env -r ts-node/register src/scripts/admin.ts",
+    "admin:identify": "node --env-file-if-exists=.env -r ts-node/register src/scripts/admin-identify.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.1",
@@ -49,5 +52,9 @@
     "ts-node": "^10.9.2",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.71.0"
+  },
+  "overrides": {
+    "fastify": "^5.12.5",
+    "deepmerge-ts": "^8.0.0"
   }
 }

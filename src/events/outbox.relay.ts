@@ -47,7 +47,7 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
     if (this.jetstream || this.connecting) return;
     this.connecting = true;
     try {
-      this.connection = await connect({ servers: process.env.NATS_URL ?? 'nats://localhost:4222', timeout: 1000 });
+      this.connection = await connect({ servers: process.env.NATS_URL ?? 'nats://localhost:4222', token: process.env.NATS_TOKEN, user: process.env.NATS_USER, pass: process.env.NATS_PASSWORD, timeout: 1000 });
       const manager = await this.connection.jetstreamManager();
       try {
         await manager.streams.info('ORFINA_EVENTS');
@@ -55,11 +55,12 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
         await manager.streams.add({ name: 'ORFINA_EVENTS', subjects: ['orfina.>'] });
       }
       this.jetstream = this.connection.jetstream();
-      this.logger.log(JSON.stringify({ event: 'outbox.broker-connected', url: process.env.NATS_URL ?? 'nats://localhost:4222' }));
+      this.logger.log(JSON.stringify({ event: 'outbox.broker-connected' }));
     } catch (error: unknown) {
+      await this.connection?.close();
       this.connection = undefined;
       this.jetstream = undefined;
-      this.logger.warn(JSON.stringify({ event: 'outbox.broker-unavailable', message: this.errorMessage(error) }));
+      this.logger.warn(JSON.stringify({ event: 'outbox.broker-unavailable', kind: error instanceof Error ? error.name : 'unavailable' }));
     } finally {
       this.connecting = false;
     }
@@ -103,7 +104,8 @@ export class OutboxRelay implements OnModuleInit, OnModuleDestroy {
           await this.handlePublishFailure(event, claimToken, error);
           this.jetstream = undefined;
           await this.connection?.close();
-          this.connection = undefined;
+          await this.connection?.close();
+      this.connection = undefined;
           break;
         }
       }

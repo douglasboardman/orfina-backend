@@ -1,3 +1,4 @@
+import { SystemAdminGuard } from '../identity/system-admin.guard';
 import { Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { EventsService } from './events.service';
@@ -10,6 +11,7 @@ export class EventsController {
   constructor(private readonly events: EventsService) {}
 
   @Get('outbox/metrics')
+  @UseGuards(SystemAdminGuard)
   outboxMetrics() {
     return this.events.outboxMetrics();
   }
