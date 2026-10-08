@@ -1,6 +1,6 @@
 {
   "name": "orfina-backend",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "private": true,
   "scripts": {
     "build": "nest build",
