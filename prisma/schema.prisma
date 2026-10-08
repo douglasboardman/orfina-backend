@@ -468,6 +468,7 @@ model InstallmentPurchase {
   type            TransactionType
   totalAmount     Int
   installmentCount Int
+  startInstallmentNumber Int @default(1)
   description     String
   firstOccurredOn DateTime    @db.Date
   canceledAt      DateTime?

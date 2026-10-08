@@ -15,7 +15,7 @@ type CreateTransaction = { accountId?: string; cardId?: string; subcategoryId: s
 type TransactionListFilters = { page: number; pageSize: number; from?: string; to?: string; accountId?: string; cardId?: string; statementId?: string; recurringRuleId?: string; categoryId?: string; subcategoryId?: string; type?: TransactionType; status?: TransactionStatus; importBatchId?: string };
 type CreateTransfer = { sourceAccountId: string; destinationAccountId: string; amount: number; occurredOn: string; description?: string; status?: AccountTransferStatus };
 type StatementPayment = { accountId: string; amount: number; paidOn: string; idempotencyKey: string };
-type InstallmentPurchaseInput = { accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; totalAmount: number; installmentCount: number; description: string; firstOccurredOn: string; notes?: string };
+type InstallmentPurchaseInput = { accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; totalAmount: number; installmentCount: number; startInstallmentNumber?: number; description: string; firstOccurredOn: string; notes?: string };
 type RecurringRuleInput = { accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; amount: number; description: string; notes?: string; startOn: string; endOn?: string };
 type RecurringProjectionSource = { id: string; householdId: string; accountId: string | null; cardId: string | null; subcategoryId: string; type: TransactionType; amount: number; description: string; notes: string | null; startOn: Date; endOn: Date | null; account: unknown; card: unknown; category: { id: string; name: string; color: string; icon: string }; subcategory: { id: string; name: string; categoryId: string; isDefault: boolean; isActive: boolean } };
 
@@ -604,6 +604,8 @@ export class FinanceService {
 
   async createInstallmentPurchase(userId: string, householdId: string, dto: InstallmentPurchaseInput) {
     await this.households.assertCanWrite(userId, householdId);
+    const startInstallmentNumber = dto.startInstallmentNumber ?? 1;
+    if (startInstallmentNumber > dto.installmentCount) throw new BadRequestException('A parcela inicial não pode ser maior que o total de parcelas.');
     const [account, card, subcategory] = await Promise.all([
       dto.accountId ? this.prisma.account.findFirst({ where: { id: dto.accountId, householdId, isActive: true } }) : null,
       dto.cardId ? this.prisma.card.findFirst({ where: { id: dto.cardId, householdId, isActive: true } }) : null,
@@ -613,9 +615,9 @@ export class FinanceService {
     if (!subcategory) throw new NotFoundException('Subcategoria não encontrada neste grupo familiar.');
     if (subcategory.category.type !== dto.type) throw new BadRequestException('O tipo da categoria deve ser igual ao da compra.');
     return this.prisma.$transaction(async (tx) => {
-      const purchase = await tx.installmentPurchase.create({ data: { householdId, accountId: account?.id, cardId: card?.id, categoryId: subcategory.categoryId, subcategoryId: subcategory.id, type: dto.type, totalAmount: dto.totalAmount, installmentCount: dto.installmentCount, description: dto.description, firstOccurredOn: this.civilDate(dto.firstOccurredOn) } });
+      const purchase = await tx.installmentPurchase.create({ data: { householdId, accountId: account?.id, cardId: card?.id, categoryId: subcategory.categoryId, subcategoryId: subcategory.id, type: dto.type, totalAmount: dto.totalAmount, installmentCount: dto.installmentCount, startInstallmentNumber, description: dto.description, firstOccurredOn: this.civilDate(dto.firstOccurredOn) } });
       const installments = this.splitAmount(dto.totalAmount, dto.installmentCount);
-      for (let index = 0; index < dto.installmentCount; index += 1) {
+      for (let index = startInstallmentNumber - 1; index < dto.installmentCount; index += 1) {
         const occurredOn = this.addMonths(dto.firstOccurredOn, index);
         const statement = card ? await this.statementForDate(tx, card, householdId, occurredOn) : undefined;
         if (statement && statement.status !== CardStatementStatus.OPEN) throw new BadRequestException('Uma parcela cairia em uma fatura já fechada; escolha uma data inicial posterior.');
@@ -623,8 +625,8 @@ export class FinanceService {
         const transaction = await tx.transaction.create({ data: { householdId, accountId: account?.id, cardId: card?.id, statementId: statement?.id, installmentPurchaseId: purchase.id, installmentNumber: index + 1, subcategoryId: subcategory.id, type: dto.type, amount, description: `${dto.description} (${index + 1}/${dto.installmentCount})`, notes: dto.notes, occurredOn: this.civilDate(occurredOn) } });
         if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
       }
-      await this.events.record(tx, { aggregateType: 'installment-purchase', aggregateId: purchase.id, eventType: 'orfina.installments.purchase-created.v1', payload: { purchaseId: purchase.id, householdId, accountId: account?.id, cardId: card?.id, totalAmount: dto.totalAmount, installmentCount: dto.installmentCount } });
-      await this.audit(tx, householdId, userId, 'installment-purchase', purchase.id, 'created', ['accountId', 'cardId', 'totalAmount', 'installmentCount', 'subcategoryId']);
+      await this.events.record(tx, { aggregateType: 'installment-purchase', aggregateId: purchase.id, eventType: 'orfina.installments.purchase-created.v1', payload: { purchaseId: purchase.id, householdId, accountId: account?.id, cardId: card?.id, totalAmount: dto.totalAmount, installmentCount: dto.installmentCount, startInstallmentNumber } });
+      await this.audit(tx, householdId, userId, 'installment-purchase', purchase.id, 'created', ['accountId', 'cardId', 'totalAmount', 'installmentCount', 'startInstallmentNumber', 'subcategoryId']);
       return purchase;
     });
   }

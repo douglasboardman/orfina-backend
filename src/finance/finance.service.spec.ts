@@ -47,6 +47,7 @@ describe('FinanceService transaction rules', () => {
   it('divides installments in cents deterministically and keeps month-end civil dates', () => {
     expect((service as unknown as { splitAmount(total: number, count: number): number[] }).splitAmount(1000, 3)).toEqual([334, 333, 333]);
     expect((service as unknown as { addMonths(date: string, months: number): Date }).addMonths('2026-01-31', 1).toISOString()).toBe('2026-02-28T12:00:00.000Z');
+    expect((service as unknown as { addMonths(date: string, months: number): Date }).addMonths('2026-01-08', 9).toISOString()).toBe('2026-10-08T12:00:00.000Z');
   });
 
   it('builds overview aggregates from the requested civil month only', async () => {

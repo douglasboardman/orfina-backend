@@ -183,7 +183,7 @@ integration('Finance integration (PostgreSQL)', () => {
     expect(recurring).toHaveLength(1);
   });
 
-  it('persists every scheduled account installment and honors the continuous recurrence launch marker', async () => {
+  it('persists scheduled account installments from the selected initial number and honors the continuous recurrence launch marker', async () => {
     const account = await finance.createAccount(ownerId, householdId, { name: 'Conta financiamento', type: 'CHECKING', initialBalance: 50_000 });
     const expense = await finance.createCategory(ownerId, householdId, { name: `Financiamento ${suffix}`, type: 'EXPENSE', color: '#5B5BD6', icon: 'handshake' });
     const subcategory = await finance.createSubcategory(ownerId, householdId, expense.id, { name: 'Parcela mensal' });
@@ -194,6 +194,12 @@ integration('Finance integration (PostgreSQL)', () => {
       expect.objectContaining({ accountId: account.id, cardId: null, installmentNumber: 1, amount: 334, description: 'Financiamento teste (1/3)' }),
       expect.objectContaining({ accountId: account.id, cardId: null, installmentNumber: 2, amount: 333, description: 'Financiamento teste (2/3)' }),
       expect.objectContaining({ accountId: account.id, cardId: null, installmentNumber: 3, amount: 333, description: 'Financiamento teste (3/3)' }),
+    ]);
+
+    const ongoingPlan = await finance.createInstallmentPurchase(ownerId, householdId, { accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, totalAmount: 1_000, installmentCount: 3, startInstallmentNumber: 2, description: 'Financiamento em andamento', firstOccurredOn: '2026-11-08' });
+    expect(await prisma.transaction.findMany({ where: { installmentPurchaseId: ongoingPlan.id }, orderBy: { installmentNumber: 'asc' } })).toEqual([
+      expect.objectContaining({ installmentNumber: 2, amount: 333, occurredOn: new Date('2026-12-08T00:00:00.000Z'), description: 'Financiamento em andamento (2/3)' }),
+      expect.objectContaining({ installmentNumber: 3, amount: 333, occurredOn: new Date('2027-01-08T00:00:00.000Z'), description: 'Financiamento em andamento (3/3)' }),
     ]);
 
     await prisma.household.update({ where: { id: householdId }, data: { recurringMaterializationMode: 'DAYS_BEFORE_EXERCISE_MONTH', recurringMaterializationValue: 10 } });

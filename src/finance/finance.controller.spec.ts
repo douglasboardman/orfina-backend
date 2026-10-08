@@ -13,6 +13,7 @@ describe('FinanceController bank catalog validation', () => {
     updateAccount: jest.fn().mockResolvedValue({ id: 'account-fixture' }),
     createCard: jest.fn().mockResolvedValue({ id: 'card-fixture' }),
     updateCard: jest.fn().mockResolvedValue({ id: 'card-fixture' }),
+    createInstallmentPurchase: jest.fn().mockResolvedValue({ id: 'installment-fixture' }),
     updateOccurrence: jest.fn().mockResolvedValue({ id: 'transaction-fixture' }),
   };
   const account = { name: 'Banrisul exemplo', type: 'CHECKING', bankName: 'Banrisul', bankLogoUrl: '/assets/banks/bank-037.svg', initialBalance: 0 };
@@ -64,6 +65,13 @@ describe('FinanceController bank catalog validation', () => {
     const response = await app.inject({ method: 'PATCH', url: `${base}/transactions/transaction-fixture/occurrence`, payload });
     expect(response.statusCode).toBe(200);
     expect(finance.updateOccurrence).toHaveBeenCalledWith('user-fixture', 'household-fixture', 'transaction-fixture', expect.objectContaining({ description: 'Parcela ajustada', amount: 2500 }), 'FOLLOWING');
+  });
+
+  it('rejects an installment start after its total and forwards a valid start', async () => {
+    const payload = { accountId: 'cl111111111111111111111111', subcategoryId: 'cl222222222222222222222222', type: 'EXPENSE', totalAmount: 240_000, installmentCount: 24, startInstallmentNumber: 10, description: 'Empréstimo em andamento', firstOccurredOn: '2026-01-08' };
+    expect((await app.inject({ method: 'POST', url: `${base}/installment-purchases`, payload })).statusCode).toBe(201);
+    expect(finance.createInstallmentPurchase).toHaveBeenCalledWith('user-fixture', 'household-fixture', payload);
+    expect((await app.inject({ method: 'POST', url: `${base}/installment-purchases`, payload: { ...payload, startInstallmentNumber: 25 } })).statusCode).toBe(422);
   });
 
   it.each(['https://example.test/bank.svg', 'data:image/svg+xml,%3Csvg%3E%3C/svg%3E', undefined])(
