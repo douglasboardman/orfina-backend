@@ -12,6 +12,9 @@ type CreateCategory = { name: string; type: CategoryType; color: string; icon?: 
 type UpdateCategory = Partial<Pick<CreateCategory, 'name' | 'color' | 'icon'>>;
 type CreateSubcategory = { name: string };
 type CreateTransaction = { accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; amount: number; description: string; occurredOn: string; notes?: string; status?: TransactionStatus };
+type TransactionConversion =
+  | { mode: 'FIXED'; accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; amount: number; description: string; notes?: string; startOn: string; endOn?: string }
+  | { mode: 'INSTALLMENT'; accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; totalAmount: number; installmentCount: number; startInstallmentNumber?: number; description: string; notes?: string; firstOccurredOn: string };
 type TransactionListFilters = { page: number; pageSize: number; from?: string; to?: string; accountId?: string; cardId?: string; statementId?: string; recurringRuleId?: string; categoryId?: string; subcategoryId?: string; type?: TransactionType; status?: TransactionStatus; importBatchId?: string };
 type CreateTransfer = { sourceAccountId: string; destinationAccountId: string; amount: number; occurredOn: string; description?: string; status?: AccountTransferStatus };
 type StatementPayment = { accountId: string; amount: number; paidOn: string; idempotencyKey: string };
@@ -421,40 +424,104 @@ export class FinanceService {
     });
   }
 
+  /** Converts a standalone transaction once; schedule occurrences cannot change kind. */
+  async convertTransaction(userId: string, householdId: string, transactionId: string, dto: TransactionConversion) {
+    await this.households.assertCanWrite(userId, householdId);
+    const [existing, account, card, subcategory] = await Promise.all([
+      this.prisma.transaction.findFirst({ where: { id: transactionId, householdId } }),
+      dto.accountId ? this.prisma.account.findFirst({ where: { id: dto.accountId, householdId, isActive: true } }) : null,
+      dto.cardId ? this.prisma.card.findFirst({ where: { id: dto.cardId, householdId, isActive: true } }) : null,
+      this.prisma.subcategory.findFirst({ where: { id: dto.subcategoryId, isActive: true, category: { householdId, isActive: true } }, include: { category: true } }),
+    ]);
+    if (!existing) throw new NotFoundException('Lançamento não encontrado neste grupo familiar.');
+    if (existing.installmentPurchaseId || existing.recurringRuleId) throw new BadRequestException('Somente lançamentos avulsos podem ser convertidos.');
+    if (existing.type !== dto.type) throw new BadRequestException('O tipo de um lançamento existente não pode ser alterado.');
+    if (dto.accountId ? !account : !card) throw new NotFoundException(dto.accountId ? 'Conta não encontrada neste grupo familiar.' : 'Cartão não encontrado neste grupo familiar.');
+    if (!subcategory || subcategory.category.type !== dto.type) throw new BadRequestException('A subcategoria deve pertencer a uma categoria ativa do mesmo tipo.');
+
+    return this.prisma.$transaction(async (tx) => {
+      if (existing.statementId) {
+        const oldStatement = await tx.cardStatement.findUnique({ where: { id: existing.statementId } });
+        if (oldStatement?.status !== CardStatementStatus.OPEN) throw new BadRequestException('Não é possível converter lançamento de uma fatura fechada ou paga.');
+      }
+
+      if (dto.mode === 'FIXED') {
+        const occurredOn = this.civilDate(dto.startOn);
+        const statement = card ? await this.statementForDate(tx, card, householdId, occurredOn) : undefined;
+        if (statement && statement.status !== CardStatementStatus.OPEN) throw new BadRequestException('Não é possível incluir a ocorrência em uma fatura fechada ou paga.');
+        const rule = await tx.recurringRule.create({ data: { householdId, accountId: account?.id, cardId: card?.id, categoryId: subcategory.categoryId, subcategoryId: subcategory.id, type: dto.type, amount: dto.amount, description: dto.description, notes: dto.notes, startOn: occurredOn, endOn: dto.endOn ? this.civilDate(dto.endOn) : undefined } });
+        const transaction = await tx.transaction.update({ where: { id: transactionId }, data: { accountId: account?.id, cardId: card?.id, statementId: statement?.id ?? null, recurringRuleId: rule.id, recurrenceOn: occurredOn, subcategoryId: subcategory.id, type: dto.type, amount: dto.amount, description: dto.description, notes: dto.notes, occurredOn }, include: { subcategory: true } });
+        if (existing.statementId) await this.adjustStatementTotal(tx, existing.statementId, -this.transactionImpact(existing.type, existing.amount));
+        if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
+        await this.events.record(tx, { aggregateType: 'recurring-rule', aggregateId: rule.id, eventType: 'orfina.recurring.rule-created.v1', payload: { ruleId: rule.id, householdId, accountId: rule.accountId, cardId: rule.cardId, amount: rule.amount, convertedTransactionId: transactionId } });
+        await this.events.record(tx, { aggregateType: 'transaction', aggregateId: transactionId, eventType: 'orfina.transactions.transaction-converted.v1', payload: { transactionId, householdId, mode: dto.mode, recurringRuleId: rule.id } });
+        await this.audit(tx, householdId, userId, 'transaction', transactionId, 'converted-to-recurring', ['recurringRuleId', 'accountId', 'cardId', 'subcategoryId', 'amount', 'occurredOn']);
+        return { mode: dto.mode, transaction, recurringRule: rule };
+      }
+
+      const startInstallmentNumber = dto.startInstallmentNumber ?? 1;
+      const installments = this.splitAmount(dto.totalAmount, dto.installmentCount);
+      const purchase = await tx.installmentPurchase.create({ data: { householdId, accountId: account?.id, cardId: card?.id, categoryId: subcategory.categoryId, subcategoryId: subcategory.id, type: dto.type, totalAmount: dto.totalAmount, installmentCount: dto.installmentCount, startInstallmentNumber, description: dto.description, firstOccurredOn: this.civilDate(dto.firstOccurredOn) } });
+      for (let index = startInstallmentNumber - 1; index < dto.installmentCount; index += 1) {
+        const occurredOn = this.installmentOccurrenceOn(dto.firstOccurredOn, startInstallmentNumber, index);
+        const statement = card ? await this.statementForDate(tx, card, householdId, occurredOn) : undefined;
+        if (statement && statement.status !== CardStatementStatus.OPEN) throw new BadRequestException('Uma parcela cairia em uma fatura já fechada; escolha uma data inicial posterior.');
+        const amount = installments[index];
+        if (index === startInstallmentNumber - 1) {
+          const transaction = await tx.transaction.update({ where: { id: transactionId }, data: { accountId: account?.id, cardId: card?.id, statementId: statement?.id ?? null, installmentPurchaseId: purchase.id, installmentNumber: index + 1, subcategoryId: subcategory.id, type: dto.type, amount, description: `${dto.description} (${index + 1}/${dto.installmentCount})`, notes: dto.notes, occurredOn } });
+          if (existing.statementId) await this.adjustStatementTotal(tx, existing.statementId, -this.transactionImpact(existing.type, existing.amount));
+          if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
+        } else {
+          const transaction = await tx.transaction.create({ data: { householdId, accountId: account?.id, cardId: card?.id, statementId: statement?.id, installmentPurchaseId: purchase.id, installmentNumber: index + 1, subcategoryId: subcategory.id, type: dto.type, amount, description: `${dto.description} (${index + 1}/${dto.installmentCount})`, notes: dto.notes, occurredOn } });
+          if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
+        }
+      }
+      await this.events.record(tx, { aggregateType: 'installment-purchase', aggregateId: purchase.id, eventType: 'orfina.installments.purchase-created.v1', payload: { purchaseId: purchase.id, householdId, accountId: purchase.accountId, cardId: purchase.cardId, totalAmount: purchase.totalAmount, installmentCount: purchase.installmentCount, startInstallmentNumber, convertedTransactionId: transactionId } });
+      await this.events.record(tx, { aggregateType: 'transaction', aggregateId: transactionId, eventType: 'orfina.transactions.transaction-converted.v1', payload: { transactionId, householdId, mode: dto.mode, installmentPurchaseId: purchase.id } });
+      await this.audit(tx, householdId, userId, 'transaction', transactionId, 'converted-to-installment', ['installmentPurchaseId', 'accountId', 'cardId', 'subcategoryId', 'amount', 'occurredOn']);
+      return { mode: dto.mode, installmentPurchase: purchase };
+    });
+  }
+
   /** Updates one occurrence, or splits its schedule so prior history stays immutable. */
   async updateOccurrence(userId: string, householdId: string, transactionId: string, dto: CreateTransaction, scope: 'ONE' | 'FOLLOWING') {
     if (scope === 'ONE') return this.updateTransaction(userId, householdId, transactionId, dto);
     await this.households.assertCanWrite(userId, householdId);
     const existing = await this.prisma.transaction.findFirst({ where: { id: transactionId, householdId }, include: { installmentPurchase: true, recurringRule: true } });
     if (!existing?.installmentPurchaseId && !existing?.recurringRuleId) throw new BadRequestException('Somente ocorrências de parcelamento ou recorrência podem ser alteradas a partir desta data.');
-    if (existing.installmentPurchaseId && (dto.cardId !== existing.cardId || dto.accountId !== existing.accountId || this.civilDate(dto.occurredOn).getTime() !== existing.occurredOn.getTime())) {
-      throw new BadRequestException('Em parcelamentos, a origem e a data da parcela permanecem fixas ao aplicar alterações futuras.');
-    }
-    const updated = await this.updateTransaction(userId, householdId, transactionId, dto);
+    // An installment schedule owns its source and calendar. Preserve those
+    // values when changing this and following occurrences, even if a stale
+    // client form posts a different selection or time representation.
+    const effectiveDto = existing.installmentPurchaseId
+      ? { ...dto, accountId: existing.accountId ?? undefined, cardId: existing.cardId ?? undefined, occurredOn: existing.occurredOn.toISOString().slice(0, 10) }
+      : dto;
+    const updated = await this.updateTransaction(userId, householdId, transactionId, effectiveDto);
     if (existing.installmentPurchaseId) return this.updateInstallmentOccurrences(userId, householdId, existing, updated);
     return this.splitRecurringRule(userId, householdId, existing, updated);
   }
 
-  private async updateInstallmentOccurrences(userId: string, householdId: string, original: { installmentPurchaseId: string | null; occurredOn: Date }, updated: { id: string; occurredOn: Date; subcategoryId: string; type: TransactionType; amount: number; description: string; notes: string | null }) {
+  private async updateInstallmentOccurrences(userId: string, householdId: string, original: { installmentPurchaseId: string | null; installmentNumber: number | null; occurredOn: Date }, updated: { id: string; occurredOn: Date; subcategoryId: string; type: TransactionType; amount: number; description: string; notes: string | null }) {
     const purchaseId = original.installmentPurchaseId!;
     const [purchase, siblings, subcategory] = await Promise.all([
       this.prisma.installmentPurchase.findFirst({ where: { id: purchaseId, householdId } }),
       this.prisma.transaction.findMany({ where: { householdId, installmentPurchaseId: purchaseId, occurredOn: { gt: original.occurredOn } }, include: { statement: true } }),
       this.prisma.subcategory.findFirst({ where: { id: updated.subcategoryId }, include: { category: true } }),
     ]);
-    if (!purchase || !subcategory) throw new NotFoundException('Parcelamento ou subcategoria não encontrados.');
+    if (!purchase || !subcategory || !original.installmentNumber) throw new NotFoundException('Parcelamento ou subcategoria não encontrados.');
     if (siblings.some((item) => item.statement && item.statement.status !== CardStatementStatus.OPEN)) throw new BadRequestException('Não é possível alterar parcelas futuras que pertencem a faturas fechadas ou pagas.');
     return this.prisma.$transaction(async (tx) => {
+      const baseDescription = updated.description.replace(/ \(\d+\/\d+\)$/, '');
+      const current = await tx.transaction.update({ where: { id: updated.id }, data: { description: `${baseDescription} (${original.installmentNumber}/${purchase.installmentCount})` } });
       for (const item of siblings) {
-        const description = `${updated.description.replace(/ \(\d+\/\d+\)$/, '')} (${item.installmentNumber}/${purchase.installmentCount})`;
+        const description = `${baseDescription} (${item.installmentNumber}/${purchase.installmentCount})`;
         const next = await tx.transaction.update({ where: { id: item.id }, data: { subcategoryId: updated.subcategoryId, type: updated.type, amount: updated.amount, description, notes: updated.notes } });
         if (item.statementId) await this.adjustStatementTotal(tx, item.statementId, this.transactionImpact(next.type, next.amount) - this.transactionImpact(item.type, item.amount));
       }
       const all = await tx.transaction.findMany({ where: { installmentPurchaseId: purchaseId }, select: { amount: true } });
-      await tx.installmentPurchase.update({ where: { id: purchaseId }, data: { subcategoryId: updated.subcategoryId, categoryId: subcategory.categoryId, type: updated.type, description: updated.description.replace(/ \(\d+\/\d+\)$/, ''), totalAmount: all.reduce((sum, item) => sum + item.amount, 0) } });
+      await tx.installmentPurchase.update({ where: { id: purchaseId }, data: { subcategoryId: updated.subcategoryId, categoryId: subcategory.categoryId, type: updated.type, description: baseDescription, totalAmount: all.reduce((sum, item) => sum + item.amount, 0) } });
       await this.events.record(tx, { aggregateType: 'installment-purchase', aggregateId: purchaseId, eventType: 'orfina.installments.occurrences-updated.v1', payload: { householdId, purchaseId, fromTransactionId: updated.id, updatedCount: siblings.length + 1 } });
       await this.audit(tx, householdId, userId, 'installment-purchase', purchaseId, 'occurrences-updated', ['subcategoryId', 'type', 'amount', 'description']);
-      return { ...updated, followingUpdated: siblings.length };
+      return { ...current, followingUpdated: siblings.length };
     });
   }
 
@@ -618,7 +685,7 @@ export class FinanceService {
       const purchase = await tx.installmentPurchase.create({ data: { householdId, accountId: account?.id, cardId: card?.id, categoryId: subcategory.categoryId, subcategoryId: subcategory.id, type: dto.type, totalAmount: dto.totalAmount, installmentCount: dto.installmentCount, startInstallmentNumber, description: dto.description, firstOccurredOn: this.civilDate(dto.firstOccurredOn) } });
       const installments = this.splitAmount(dto.totalAmount, dto.installmentCount);
       for (let index = startInstallmentNumber - 1; index < dto.installmentCount; index += 1) {
-        const occurredOn = this.addMonths(dto.firstOccurredOn, index);
+        const occurredOn = this.installmentOccurrenceOn(dto.firstOccurredOn, startInstallmentNumber, index);
         const statement = card ? await this.statementForDate(tx, card, householdId, occurredOn) : undefined;
         if (statement && statement.status !== CardStatementStatus.OPEN) throw new BadRequestException('Uma parcela cairia em uma fatura já fechada; escolha uma data inicial posterior.');
         const amount = installments[index];
@@ -782,6 +849,15 @@ export class FinanceService {
     const normalizedMonth = ((targetMonth % 12) + 12) % 12;
     const lastDay = new Date(Date.UTC(targetYear, normalizedMonth + 1, 0)).getUTCDate();
     return this.utcDate(targetYear, normalizedMonth, Math.min(date.getUTCDate(), lastDay));
+  }
+
+  /**
+   * The form's date is the occurrence being recorded, rather than a hidden
+   * first installment. This lets someone register an ongoing plan at, for
+   * example, installment 10 without shifting it another nine months ahead.
+   */
+  private installmentOccurrenceOn(occurrenceOn: string | Date, startInstallmentNumber: number, index: number) {
+    return this.addMonths(occurrenceOn, index - (startInstallmentNumber - 1));
   }
 
   /** Returns the civil date on which one continuous occurrence becomes an actual transaction. */

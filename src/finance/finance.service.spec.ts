@@ -26,6 +26,18 @@ describe('FinanceService transaction rules', () => {
     await expect(service.createTransaction('user_1', 'household_1', dto)).rejects.toBeInstanceOf(BadRequestException);
   });
 
+  it('only converts a standalone transaction and preserves its financial type', async () => {
+    households.assertCanWrite.mockResolvedValue({ role: 'MEMBER' });
+    prisma.transaction.findFirst.mockResolvedValue({ id: 'transaction_1', type: TransactionType.EXPENSE, installmentPurchaseId: 'purchase_1', recurringRuleId: null });
+    prisma.account.findFirst.mockResolvedValue({ id: dto.accountId });
+    prisma.subcategory.findFirst.mockResolvedValue({ id: dto.subcategoryId, category: { type: TransactionType.EXPENSE } });
+
+    await expect(service.convertTransaction('user_1', 'household_1', 'transaction_1', { mode: 'FIXED', ...dto, startOn: dto.occurredOn })).rejects.toBeInstanceOf(BadRequestException);
+
+    prisma.transaction.findFirst.mockResolvedValue({ id: 'transaction_1', type: TransactionType.EXPENSE, installmentPurchaseId: null, recurringRuleId: null });
+    await expect(service.convertTransaction('user_1', 'household_1', 'transaction_1', { mode: 'FIXED', ...dto, type: TransactionType.INCOME, startOn: dto.occurredOn })).rejects.toBeInstanceOf(BadRequestException);
+  });
+
   it('queries transactions with tenant scope, filters and pagination', async () => {
     households.assertMember.mockResolvedValue({ role: 'MEMBER' });
     prisma.transaction.findMany.mockReturnValue(Promise.resolve([]));

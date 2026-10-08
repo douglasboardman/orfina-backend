@@ -14,6 +14,7 @@ describe('FinanceController bank catalog validation', () => {
     createCard: jest.fn().mockResolvedValue({ id: 'card-fixture' }),
     updateCard: jest.fn().mockResolvedValue({ id: 'card-fixture' }),
     createInstallmentPurchase: jest.fn().mockResolvedValue({ id: 'installment-fixture' }),
+    convertTransaction: jest.fn().mockResolvedValue({ mode: 'FIXED' }),
     updateOccurrence: jest.fn().mockResolvedValue({ id: 'transaction-fixture' }),
   };
   const account = { name: 'Banrisul exemplo', type: 'CHECKING', bankName: 'Banrisul', bankLogoUrl: '/assets/banks/bank-037.svg', initialBalance: 0 };
@@ -65,6 +66,19 @@ describe('FinanceController bank catalog validation', () => {
     const response = await app.inject({ method: 'PATCH', url: `${base}/transactions/transaction-fixture/occurrence`, payload });
     expect(response.statusCode).toBe(200);
     expect(finance.updateOccurrence).toHaveBeenCalledWith('user-fixture', 'household-fixture', 'transaction-fixture', expect.objectContaining({ description: 'Parcela ajustada', amount: 2500 }), 'FOLLOWING');
+  });
+
+  it('accepts only a well-formed one-off conversion request', async () => {
+    const payload = { mode: 'FIXED', accountId: 'cl111111111111111111111111', subcategoryId: 'cl222222222222222222222222', type: 'EXPENSE', amount: 2500, description: 'Conta convertida', startOn: '2026-11-08' };
+    expect((await app.inject({ method: 'POST', url: `${base}/transactions/transaction-fixture/convert`, payload })).statusCode).toBe(201);
+    expect(finance.convertTransaction).toHaveBeenCalledWith('user-fixture', 'household-fixture', 'transaction-fixture', payload);
+    expect((await app.inject({ method: 'POST', url: `${base}/transactions/transaction-fixture/convert`, payload: { ...payload, mode: 'INSTALLMENT' } })).statusCode).toBe(422);
+  });
+
+  it('accepts a well-formed income conversion into installments', async () => {
+    const payload = { mode: 'INSTALLMENT', accountId: 'cl111111111111111111111111', subcategoryId: 'cl222222222222222222222222', type: 'INCOME', totalAmount: 154_440, installmentCount: 24, startInstallmentNumber: 4, description: 'Recebimento parcelado', firstOccurredOn: '2026-10-05' };
+    expect((await app.inject({ method: 'POST', url: `${base}/transactions/transaction-fixture/convert`, payload })).statusCode).toBe(201);
+    expect(finance.convertTransaction).toHaveBeenCalledWith('user-fixture', 'household-fixture', 'transaction-fixture', payload);
   });
 
   it('rejects an installment start after its total and forwards a valid start', async () => {

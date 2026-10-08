@@ -198,8 +198,8 @@ integration('Finance integration (PostgreSQL)', () => {
 
     const ongoingPlan = await finance.createInstallmentPurchase(ownerId, householdId, { accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, totalAmount: 1_000, installmentCount: 3, startInstallmentNumber: 2, description: 'Financiamento em andamento', firstOccurredOn: '2026-11-08' });
     expect(await prisma.transaction.findMany({ where: { installmentPurchaseId: ongoingPlan.id }, orderBy: { installmentNumber: 'asc' } })).toEqual([
-      expect.objectContaining({ installmentNumber: 2, amount: 333, occurredOn: new Date('2026-12-08T00:00:00.000Z'), description: 'Financiamento em andamento (2/3)' }),
-      expect.objectContaining({ installmentNumber: 3, amount: 333, occurredOn: new Date('2027-01-08T00:00:00.000Z'), description: 'Financiamento em andamento (3/3)' }),
+      expect.objectContaining({ installmentNumber: 2, amount: 333, occurredOn: new Date('2026-11-08T00:00:00.000Z'), description: 'Financiamento em andamento (2/3)' }),
+      expect.objectContaining({ installmentNumber: 3, amount: 333, occurredOn: new Date('2026-12-08T00:00:00.000Z'), description: 'Financiamento em andamento (3/3)' }),
     ]);
 
     await prisma.household.update({ where: { id: householdId }, data: { recurringMaterializationMode: 'DAYS_BEFORE_EXERCISE_MONTH', recurringMaterializationValue: 10 } });
@@ -208,6 +208,53 @@ integration('Finance integration (PostgreSQL)', () => {
     expect(await prisma.transaction.findUnique({ where: { recurringRuleId_recurrenceOn: { recurringRuleId: rule.id, recurrenceOn: new Date('2026-11-08T12:00:00.000Z') } } })).toMatchObject({ status: 'PENDING' });
     await finance.materializeRecurringRules(new Date('2026-11-08T12:00:00.000Z'));
     expect(await prisma.transaction.findUnique({ where: { recurringRuleId_recurrenceOn: { recurringRuleId: rule.id, recurrenceOn: new Date('2026-11-08T12:00:00.000Z') } } })).toMatchObject({ status: 'POSTED' });
+  });
+
+  it('converts only standalone transactions into recurring rules or installment purchases without duplication', async () => {
+    const account = await finance.createAccount(ownerId, householdId, { name: `Conta conversão ${suffix}`, type: 'CHECKING', initialBalance: 0 });
+    const category = await finance.createCategory(ownerId, householdId, { name: `Conversões ${suffix}`, type: 'EXPENSE', color: '#5B5BD6', icon: 'sync' });
+    const subcategory = await finance.createSubcategory(ownerId, householdId, category.id, { name: 'Compromisso' });
+
+    const standaloneRecurring = await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, amount: 1_000, description: 'Assinatura avulsa', occurredOn: '2026-10-08' });
+    const recurring = await finance.convertTransaction(ownerId, householdId, standaloneRecurring.id, { mode: 'FIXED', accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, amount: 1_200, description: 'Assinatura convertida', startOn: '2026-10-08' });
+    expect(recurring.mode).toBe('FIXED');
+    expect(await prisma.transaction.findUnique({ where: { id: standaloneRecurring.id } })).toEqual(expect.objectContaining({ recurringRuleId: expect.any(String), recurrenceOn: new Date('2026-10-08T00:00:00.000Z'), amount: 1_200 }));
+    await expect(finance.convertTransaction(ownerId, householdId, standaloneRecurring.id, { mode: 'INSTALLMENT', accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, totalAmount: 1_200, installmentCount: 2, startInstallmentNumber: 1, description: 'Conversão proibida', firstOccurredOn: '2026-10-08' })).rejects.toBeInstanceOf(BadRequestException);
+
+    const standaloneInstallment = await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, amount: 1_000, description: 'Compra avulsa', occurredOn: '2026-10-08' });
+    const installment = await finance.convertTransaction(ownerId, householdId, standaloneInstallment.id, { mode: 'INSTALLMENT', accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, totalAmount: 1_000, installmentCount: 3, startInstallmentNumber: 1, description: 'Compra convertida', firstOccurredOn: '2026-10-08' });
+    expect(installment.mode).toBe('INSTALLMENT');
+    if (installment.mode !== 'INSTALLMENT') throw new Error('Conversão em parcelas não retornada.');
+    const installments = await prisma.transaction.findMany({ where: { installmentPurchaseId: installment.installmentPurchase.id }, orderBy: { installmentNumber: 'asc' } });
+    expect(installments).toEqual([
+      expect.objectContaining({ id: standaloneInstallment.id, installmentNumber: 1, amount: 334, description: 'Compra convertida (1/3)' }),
+      expect.objectContaining({ installmentNumber: 2, amount: 333, description: 'Compra convertida (2/3)' }),
+      expect.objectContaining({ installmentNumber: 3, amount: 333, description: 'Compra convertida (3/3)' }),
+    ]);
+
+    const ongoingInstallment = await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, amount: 1_000, description: 'Compra avulsa em andamento', occurredOn: '2026-11-05' });
+    const convertedOngoing = await finance.convertTransaction(ownerId, householdId, ongoingInstallment.id, { mode: 'INSTALLMENT', accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, totalAmount: 1_000, installmentCount: 5, startInstallmentNumber: 4, description: 'Compra convertida em andamento', firstOccurredOn: '2026-11-05' });
+    if (convertedOngoing.mode !== 'INSTALLMENT') throw new Error('Conversão em andamento não retornada.');
+    expect(await prisma.transaction.findMany({ where: { installmentPurchaseId: convertedOngoing.installmentPurchase.id }, orderBy: { installmentNumber: 'asc' } })).toEqual([
+      expect.objectContaining({ id: ongoingInstallment.id, installmentNumber: 4, occurredOn: new Date('2026-11-05T00:00:00.000Z'), description: 'Compra convertida em andamento (4/5)' }),
+      expect.objectContaining({ installmentNumber: 5, occurredOn: new Date('2026-12-05T00:00:00.000Z'), description: 'Compra convertida em andamento (5/5)' }),
+    ]);
+  });
+
+  it('preserves an installment source and date when applying an edit to following occurrences', async () => {
+    const account = await finance.createAccount(ownerId, householdId, { name: `Conta ocorrências ${suffix}`, type: 'CHECKING', initialBalance: 0 });
+    const category = await finance.createCategory(ownerId, householdId, { name: `Ocorrências ${suffix}`, type: 'EXPENSE', color: '#5B5BD6', icon: 'sync' });
+    const subcategory = await finance.createSubcategory(ownerId, householdId, category.id, { name: 'Parcela' });
+    const purchase = await finance.createInstallmentPurchase(ownerId, householdId, { accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, totalAmount: 1_000, installmentCount: 2, description: 'Compra parcelada', firstOccurredOn: '2026-11-08' });
+    const first = await prisma.transaction.findFirstOrThrow({ where: { installmentPurchaseId: purchase.id, installmentNumber: 1 } });
+
+    await finance.updateOccurrence(ownerId, householdId, first.id, { cardId: 'cmv0000000000000000000000', subcategoryId: subcategory.id, type: TransactionType.EXPENSE, amount: 750, description: 'Compra ajustada', occurredOn: '2026-12-20' }, 'FOLLOWING');
+
+    const occurrences = await prisma.transaction.findMany({ where: { installmentPurchaseId: purchase.id }, orderBy: { installmentNumber: 'asc' } });
+    expect(occurrences).toEqual([
+      expect.objectContaining({ accountId: account.id, cardId: null, occurredOn: new Date('2026-11-08T00:00:00.000Z'), amount: 750, description: 'Compra ajustada (1/2)' }),
+      expect.objectContaining({ accountId: account.id, cardId: null, occurredOn: new Date('2026-12-08T00:00:00.000Z'), amount: 750, description: 'Compra ajustada (2/2)' }),
+    ]);
   });
 
   it('keeps budgets and goals tenant-scoped, auditable and idempotent', async () => {
