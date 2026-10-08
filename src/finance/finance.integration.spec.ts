@@ -183,6 +183,27 @@ integration('Finance integration (PostgreSQL)', () => {
     expect(recurring).toHaveLength(1);
   });
 
+  it('persists every scheduled account installment and honors the continuous recurrence launch marker', async () => {
+    const account = await finance.createAccount(ownerId, householdId, { name: 'Conta financiamento', type: 'CHECKING', initialBalance: 50_000 });
+    const expense = await finance.createCategory(ownerId, householdId, { name: `Financiamento ${suffix}`, type: 'EXPENSE', color: '#5B5BD6', icon: 'handshake' });
+    const subcategory = await finance.createSubcategory(ownerId, householdId, expense.id, { name: 'Parcela mensal' });
+
+    const plan = await finance.createInstallmentPurchase(ownerId, householdId, { accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, totalAmount: 1_000, installmentCount: 3, description: 'Financiamento teste', firstOccurredOn: '2026-11-08' });
+    const installments = await prisma.transaction.findMany({ where: { installmentPurchaseId: plan.id }, orderBy: { installmentNumber: 'asc' } });
+    expect(installments).toEqual([
+      expect.objectContaining({ accountId: account.id, cardId: null, installmentNumber: 1, amount: 334, description: 'Financiamento teste (1/3)' }),
+      expect.objectContaining({ accountId: account.id, cardId: null, installmentNumber: 2, amount: 333, description: 'Financiamento teste (2/3)' }),
+      expect.objectContaining({ accountId: account.id, cardId: null, installmentNumber: 3, amount: 333, description: 'Financiamento teste (3/3)' }),
+    ]);
+
+    await prisma.household.update({ where: { id: householdId }, data: { recurringMaterializationMode: 'DAYS_BEFORE_EXERCISE_MONTH', recurringMaterializationValue: 10 } });
+    const rule = await finance.createRecurringRule(ownerId, householdId, { accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, amount: 400, description: 'Conta antecipada', startOn: '2026-11-08' });
+    await finance.materializeRecurringRules(new Date('2026-10-22T12:00:00.000Z'));
+    expect(await prisma.transaction.findUnique({ where: { recurringRuleId_recurrenceOn: { recurringRuleId: rule.id, recurrenceOn: new Date('2026-11-08T12:00:00.000Z') } } })).toMatchObject({ status: 'PENDING' });
+    await finance.materializeRecurringRules(new Date('2026-11-08T12:00:00.000Z'));
+    expect(await prisma.transaction.findUnique({ where: { recurringRuleId_recurrenceOn: { recurringRuleId: rule.id, recurrenceOn: new Date('2026-11-08T12:00:00.000Z') } } })).toMatchObject({ status: 'POSTED' });
+  });
+
   it('keeps budgets and goals tenant-scoped, auditable and idempotent', async () => {
     const account = await finance.createAccount(ownerId, householdId, { name: 'Conta orçamento', type: 'CHECKING', initialBalance: 0 });
     const category = await finance.createCategory(ownerId, householdId, { name: `Orçamento ${suffix}`, type: 'EXPENSE', color: '#5B5BD6', icon: 'sell' });

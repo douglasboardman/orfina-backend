@@ -1,7 +1,7 @@
 import { CsrfGuard } from './csrf.guard';
 import { hashCsrf } from './auth.service';
 describe('CsrfGuard session binding', () => {
-  const auth = { sessionFromToken: jest.fn() }; const guard = new CsrfGuard(auth as never);
+  const auth = { sessionFromToken: jest.fn(), sessionFromRefreshToken: jest.fn() }; const guard = new CsrfGuard(auth as never);
   const context = (headers: Record<string, string>, url = '/api/admin/access-grants') => ({ switchToHttp: () => ({ getRequest: () => ({ method: 'POST', url, headers }) }) });
   beforeEach(() => { process.env.FRONTEND_URLS = 'https://app.example.test'; auth.sessionFromToken.mockResolvedValue({ csrfTokenHash: hashCsrf('one') }); });
   afterEach(() => { delete process.env.FRONTEND_URLS; });

@@ -1,5 +1,5 @@
 import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { HouseholdInvitationStatus, HouseholdRole } from '@prisma/client';
+import { HouseholdInvitationStatus, HouseholdRole, RecurringMaterializationMode } from '@prisma/client';
 import { EventsService } from '../events/events.service';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -42,6 +42,21 @@ export class HouseholdsService {
         eventType: 'orfina.households.household-renamed.v1',
         payload: { householdId, name },
       });
+      return household;
+    });
+  }
+
+  async updateSettings(userId: string, householdId: string, settings: { name?: string; recurringMaterializationMode?: RecurringMaterializationMode; recurringMaterializationValue?: number }) {
+    if (settings.name && Object.keys(settings).length === 1) return this.rename(userId, householdId, settings.name);
+    await this.assertCanManage(userId, householdId);
+    const current = await this.prisma.household.findUnique({ where: { id: householdId } });
+    if (!current) throw new ForbiddenException('Grupo familiar não encontrado.');
+    const mode = settings.recurringMaterializationMode ?? current.recurringMaterializationMode;
+    const value = settings.recurringMaterializationValue ?? current.recurringMaterializationValue;
+    if ((mode === RecurringMaterializationMode.EXERCISE_MONTH_DAY && (value < 1 || value > 15)) || (mode === RecurringMaterializationMode.DAYS_BEFORE_EXERCISE_MONTH && (value < 1 || value > 28)) || (mode === RecurringMaterializationMode.ON_OCCURRENCE_DATE && value !== 0)) throw new ForbiddenException('Configuração de geração de recorrências inválida.');
+    return this.prisma.$transaction(async (tx) => {
+      const household = await tx.household.update({ where: { id: householdId }, data: { ...settings, recurringMaterializationValue: mode === RecurringMaterializationMode.ON_OCCURRENCE_DATE ? 0 : value }, include: { members: { where: { userId }, select: { role: true } } } });
+      await this.events.record(tx, { aggregateType: 'household', aggregateId: householdId, eventType: 'orfina.households.recurring-materialization-updated.v1', payload: { householdId, recurringMaterializationMode: household.recurringMaterializationMode, recurringMaterializationValue: household.recurringMaterializationValue } });
       return household;
     });
   }

@@ -11,8 +11,11 @@ export class CsrfGuard implements CanActivate {
     const request = context.switchToHttp().getRequest<{ method: string; url: string; headers: { cookie?: string; origin?: string; authorization?: string; 'x-orfina-csrf'?: string } }>();
     if (!unsafeMethods.has(request.method)) return true;
     if (!request.headers.origin || !allowedOrigins().includes(request.headers.origin)) identityError(403, 'CSRF_INVALID', 'Origem não autorizada.');
-    const session = await this.auth.sessionFromToken(readCookie(request.headers.cookie, cookieName('session')) ?? request.headers.authorization?.replace(/^Bearer /, ''));
-    if (!session && request.url.split('?')[0] === '/api/auth/logout') return true;
+    const route = request.url.split('?')[0];
+    const accessToken = readCookie(request.headers.cookie, cookieName('session')) ?? request.headers.authorization?.replace(/^Bearer /, '');
+    const session = await this.auth.sessionFromToken(accessToken)
+      ?? (route === '/api/auth/refresh' ? await this.auth.sessionFromRefreshToken(readCookie(request.headers.cookie, cookieName('refresh'))) : null);
+    if (!session && route === '/api/auth/logout') return true;
     if (!session) identityError(401, 'SESSION_INVALID', 'Sessão inválida ou acesso restrito.');
     const cookie = readCookie(request.headers.cookie, cookieName('csrf'));
     const header = request.headers['x-orfina-csrf'];

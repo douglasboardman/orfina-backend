@@ -48,6 +48,12 @@ enum RecurringRuleStatus {
   ENDED
 }
 
+enum RecurringMaterializationMode {
+  ON_OCCURRENCE_DATE
+  EXERCISE_MONTH_DAY
+  DAYS_BEFORE_EXERCISE_MONTH
+}
+
 enum SavingsGoalStatus {
   ACTIVE
   PAUSED
@@ -186,6 +192,8 @@ model Household {
   name        String
   currency    String            @default("BRL")
   timezone    String            @default("America/Sao_Paulo")
+  recurringMaterializationMode  RecurringMaterializationMode @default(ON_OCCURRENCE_DATE)
+  recurringMaterializationValue Int @default(0)
   createdAt   DateTime          @default(now())
   updatedAt   DateTime          @updatedAt
   members     HouseholdMember[]
@@ -274,6 +282,7 @@ model Account {
   incomingTransfers AccountTransfer[] @relation("TransferDestination")
   cardPayments   CardPayment[]
   recurringRules RecurringRule[]
+  installmentPurchases InstallmentPurchase[]
   @@index([householdId])
 }
 
@@ -452,7 +461,8 @@ model CardPayment {
 model InstallmentPurchase {
   id              String      @id @default(cuid())
   householdId     String
-  cardId          String
+  accountId       String?
+  cardId          String?
   categoryId      String
   subcategoryId   String
   type            TransactionType
@@ -464,11 +474,13 @@ model InstallmentPurchase {
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
   household       Household   @relation(fields: [householdId], references: [id], onDelete: Cascade)
-  card            Card        @relation(fields: [cardId], references: [id], onDelete: Restrict)
+  account         Account?    @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  card            Card?       @relation(fields: [cardId], references: [id], onDelete: Restrict)
   category        Category    @relation(fields: [categoryId], references: [id], onDelete: Restrict)
   subcategory     Subcategory @relation(fields: [subcategoryId], references: [id], onDelete: Restrict)
   transactions    Transaction[]
   @@index([householdId, cardId])
+  @@index([householdId, accountId])
 }
 
 model RecurringRule {
@@ -485,6 +497,7 @@ model RecurringRule {
   startOn       DateTime            @db.Date
   endOn         DateTime?           @db.Date
   status        RecurringRuleStatus @default(ACTIVE)
+  predecessorId String?
   createdAt     DateTime            @default(now())
   updatedAt     DateTime            @updatedAt
   household     Household           @relation(fields: [householdId], references: [id], onDelete: Cascade)
@@ -493,7 +506,10 @@ model RecurringRule {
   category      Category             @relation(fields: [categoryId], references: [id], onDelete: Restrict)
   subcategory   Subcategory          @relation(fields: [subcategoryId], references: [id], onDelete: Restrict)
   transactions  Transaction[]
+  predecessor   RecurringRule? @relation("RecurringRuleHistory", fields: [predecessorId], references: [id], onDelete: Restrict)
+  successors    RecurringRule[] @relation("RecurringRuleHistory")
   @@index([householdId, status])
+  @@index([predecessorId])
 }
 
 model AuditLog {

@@ -15,6 +15,7 @@ describe('AuthService access gate', () => {
     expect(result.csrf).toHaveLength(64);
     expect(tx.session.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ csrfTokenHash: hashCsrf(result.csrf) }) }));
     expect(jwt.sign).toHaveBeenCalledWith({ sub: 'user_1', sid: 'session_1' });
+    expect(jwt.sign).toHaveBeenCalledWith({ sub: 'user_1', sid: 'session_1', tokenType: 'refresh' }, expect.objectContaining({ expiresIn: 604800 }));
   });
   it('refuses disabled access before issuing a session', async () => {
     tx.accessGrant.findUnique.mockResolvedValue({ status: 'DISABLED' });
@@ -39,5 +40,12 @@ describe('AuthService access gate', () => {
     tx.session.updateMany.mockResolvedValue({ count: 0 });
     await expect(service.rotateSession({ id: 'user_1' } as never, 'old')).rejects.toMatchObject({ status: 401 });
     expect(tx.session.create).not.toHaveBeenCalled();
+  });
+  it('accepts refresh tokens only when explicitly marked as refresh proofs', async () => {
+    jwt.verify.mockReturnValueOnce({ sub: 'user_1', sid: 'session_1', tokenType: 'access' });
+    await expect(service.sessionFromRefreshToken('access-token')).resolves.toBeNull();
+    jwt.verify.mockReturnValueOnce({ sub: 'user_1', sid: 'session_1', tokenType: 'refresh' });
+    tx.session.findFirst.mockResolvedValue({ id: 'session_1' });
+    await expect(service.sessionFromRefreshToken('refresh-token')).resolves.toEqual({ id: 'session_1' });
   });
 });

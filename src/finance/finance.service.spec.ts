@@ -1,10 +1,10 @@
 import { BadRequestException } from '@nestjs/common';
-import { TransactionType } from '@prisma/client';
+import { RecurringMaterializationMode, TransactionType } from '@prisma/client';
 import { FinanceService } from './finance.service';
 
 describe('FinanceService transaction rules', () => {
   const prisma = {
-    account: { findFirst: jest.fn() },
+    account: { findFirst: jest.fn(), findMany: jest.fn() },
     subcategory: { findFirst: jest.fn() },
     transaction: { findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn() },
     cardStatement: { findMany: jest.fn() },
@@ -51,14 +51,24 @@ describe('FinanceService transaction rules', () => {
 
   it('builds overview aggregates from the requested civil month only', async () => {
     households.assertMember.mockResolvedValue({ role: 'MEMBER' });
-    (prisma as unknown as { account: { findFirst: jest.Mock; findMany: jest.Mock } }).account = { findFirst: jest.fn(), findMany: jest.fn().mockResolvedValue([{ initialBalance: 1000, transactions: [], cardPayments: [], outgoingTransfers: [], incomingTransfers: [] }]) };
+    prisma.account.findMany.mockResolvedValue([{
+        initialBalance: 1000,
+        transactions: [
+          { occurredOn: new Date('2026-03-10T12:00:00.000Z'), amount: 50, type: TransactionType.EXPENSE, status: 'POSTED' },
+          { occurredOn: new Date('2026-04-04T12:00:00.000Z'), amount: 250, type: TransactionType.INCOME, status: 'POSTED' },
+        ],
+        cardPayments: [{ paidOn: new Date('2026-04-20T12:00:00.000Z'), amount: 25 }],
+        outgoingTransfers: [{ occurredOn: new Date('2026-04-10T12:00:00.000Z'), amount: 100, status: 'POSTED' }],
+        incomingTransfers: [{ occurredOn: new Date('2026-03-20T12:00:00.000Z'), amount: 50, status: 'POSTED' }],
+    }]);
     prisma.transaction.findMany
       .mockResolvedValueOnce([{ id: 'recent', occurredOn: new Date('2026-04-04T12:00:00.000Z'), amount: 250, type: TransactionType.INCOME, status: 'POSTED', subcategory: { categoryId: 'income', category: { name: 'Salário', color: '#123456' } } }])
       .mockResolvedValueOnce([
         { occurredOn: new Date('2026-04-04T12:00:00.000Z'), amount: 250, type: TransactionType.INCOME, status: 'POSTED', subcategory: { categoryId: 'income', category: { name: 'Salário', color: '#123456' } } },
         { occurredOn: new Date('2026-04-09T12:00:00.000Z'), amount: 100, type: TransactionType.EXPENSE, status: 'PENDING', subcategory: { categoryId: 'food', category: { name: 'Mercado', color: '#654321' } } },
       ])
-      .mockResolvedValueOnce([{ amount: 75, type: TransactionType.EXPENSE, status: 'POSTED' }]);
+      .mockResolvedValueOnce([{ amount: 75, type: TransactionType.EXPENSE, status: 'POSTED' }])
+      .mockResolvedValueOnce([]);
     prisma.cardStatement.findMany.mockResolvedValue([]);
     prisma.recurringRule.findMany.mockResolvedValue([]);
     prisma.monthlyBudget.findMany.mockResolvedValue([{ categoryId: 'food', limitAmount: 500 }]);
@@ -66,9 +76,36 @@ describe('FinanceService transaction rules', () => {
     const overview = await service.overview('user_1', 'household_1', '2026-04');
 
     expect(overview.referenceMonth).toBe('2026-04');
-    expect(overview.indicators).toMatchObject({ realizedIncome: 250, realizedExpenses: 0, pendingCommitments: 100, availableBalance: 1000 });
+    expect(overview.indicators).toMatchObject({ realizedIncome: 250, realizedExpenses: 0, pendingCommitments: 100, availableBalance: 1125 });
+    expect(overview.accounts[0].balance).toBe(1125);
     expect(overview.comparison.expenses).toEqual({ current: 0, previous: 75 });
     expect(overview.charts.expenseByCategory).toEqual([]);
     expect(prisma.transaction.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ occurredOn: { gte: new Date('2026-04-01T12:00:00.000Z'), lt: new Date('2026-05-01T12:00:00.000Z') } }) }));
+    expect(prisma.account.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      include: expect.objectContaining({
+        transactions: { where: { status: 'POSTED', occurredOn: { lt: new Date('2026-05-01T12:00:00.000Z') } } },
+        cardPayments: { where: { paidOn: { lt: new Date('2026-05-01T12:00:00.000Z') } } },
+        outgoingTransfers: { where: { status: 'POSTED', occurredOn: { lt: new Date('2026-05-01T12:00:00.000Z') } } },
+        incomingTransfers: { where: { status: 'POSTED', occurredOn: { lt: new Date('2026-05-01T12:00:00.000Z') } } },
+      }),
+    }));
+  });
+
+  it('projects only missing recurring occurrences into a future reference month', () => {
+    const project = (service as unknown as { projectRecurringOccurrences(rules: unknown[], end: Date, existing: Set<string>): Array<{ occurredOn: Date; isForecast: boolean }> }).projectRecurringOccurrences.bind(service);
+    const category = { id: 'cat_1', name: 'Moradia', color: '#123456', icon: 'home' };
+    const rules = [{ id: 'rule_1', householdId: 'household_1', accountId: 'account_1', cardId: null, subcategoryId: 'sub_1', type: TransactionType.EXPENSE, amount: 9900, description: 'Aluguel', notes: null, startOn: new Date('2026-10-08T12:00:00.000Z'), endOn: new Date('2027-10-08T12:00:00.000Z'), account: {}, card: null, category, subcategory: { id: 'sub_1', name: 'Aluguel', categoryId: 'cat_1', isDefault: true, isActive: true } }];
+    const projected = project(rules, new Date('2026-12-01T12:00:00.000Z'), new Set(['rule_1:2026-10-08']));
+    expect(projected.map((item) => item.occurredOn.toISOString().slice(0, 10))).toEqual(['2026-11-08']);
+    expect(projected[0].isForecast).toBe(true);
+  });
+
+  it('calculates the household launch marker without changing the civil occurrence date', () => {
+    const launchOn = (service as unknown as { recurringLaunchOn(occurredOn: Date, mode: RecurringMaterializationMode, value: number): Date }).recurringLaunchOn.bind(service);
+    const occurrence = new Date('2026-11-08T12:00:00.000Z');
+
+    expect(launchOn(occurrence, RecurringMaterializationMode.ON_OCCURRENCE_DATE, 0).toISOString()).toBe('2026-11-08T12:00:00.000Z');
+    expect(launchOn(occurrence, RecurringMaterializationMode.EXERCISE_MONTH_DAY, 5).toISOString()).toBe('2026-11-05T12:00:00.000Z');
+    expect(launchOn(occurrence, RecurringMaterializationMode.DAYS_BEFORE_EXERCISE_MONTH, 10).toISOString()).toBe('2026-10-22T12:00:00.000Z');
   });
 });

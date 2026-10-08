@@ -54,7 +54,12 @@ export class AuthService {
     const ttlDays = Number(process.env.SESSION_TTL_DAYS ?? 7);
     const expiresAt = new Date(Date.now() + ttlDays * 86400000);
     const session = await tx.session.create({ data: { userId: user.id, expiresAt, csrfTokenHash: hashCsrf(csrf) } });
-    return { session, csrf, token: this.jwt.sign({ sub: user.id, sid: session.id }) };
+    return {
+      session,
+      csrf,
+      token: this.jwt.sign({ sub: user.id, sid: session.id }),
+      refreshToken: this.jwt.sign({ sub: user.id, sid: session.id, tokenType: 'refresh' }, { expiresIn: ttlDays * 86400 }),
+    };
   }
 
   async createSession(user: User) {
@@ -88,6 +93,15 @@ export class AuthService {
     let payload: { sub?: string; sid?: string };
     try { payload = this.jwt.verify(token, { algorithms: ['HS256'] }); } catch { return null; }
     if (typeof payload.sub !== 'string' || typeof payload.sid !== 'string') return null;
+    return this.activeSession(payload.sid, payload.sub);
+  }
+
+  /** Refresh proofs outlive the short access JWT, but remain bound to the same revocable database session. */
+  async sessionFromRefreshToken(token?: string) {
+    if (!token) return null;
+    let payload: { sub?: string; sid?: string; tokenType?: string };
+    try { payload = this.jwt.verify(token, { algorithms: ['HS256'] }); } catch { return null; }
+    if (payload.tokenType !== 'refresh' || typeof payload.sub !== 'string' || typeof payload.sid !== 'string') return null;
     return this.activeSession(payload.sid, payload.sub);
   }
 }

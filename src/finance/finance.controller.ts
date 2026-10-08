@@ -5,11 +5,12 @@ import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { AuthenticatedUser } from '../auth/jwt.strategy';
 import { FinanceService } from './finance.service';
+import { financialBrandLogoSchema } from './financial-brand-logo.schema';
 
 const money = z.number().int().min(0).max(999_999_999);
-const accountSchema = z.object({ name: z.string().trim().min(2).max(80), type: z.nativeEnum(AccountType), bankName: z.string().trim().max(80).optional(), bankLogoUrl: z.string().url().optional(), initialBalance: z.number().int().min(-999_999_999).max(999_999_999).default(0) });
+const accountSchema = z.object({ name: z.string().trim().min(2).max(80), type: z.nativeEnum(AccountType), bankName: z.string().trim().max(80).optional(), bankLogoUrl: financialBrandLogoSchema.optional(), initialBalance: z.number().int().min(-999_999_999).max(999_999_999).default(0) });
 const accountUpdateSchema = accountSchema.partial();
-const cardSchema = z.object({ name: z.string().trim().min(2).max(80), issuerName: z.string().trim().max(80).optional(), issuerLogoUrl: z.string().url().optional(), network: z.nativeEnum(CardNetwork), lastFour: z.string().regex(/^\d{4}$/).optional(), creditLimit: money.optional(), closingDay: z.number().int().min(1).max(28).default(1), dueDay: z.number().int().min(1).max(28).default(10) });
+const cardSchema = z.object({ name: z.string().trim().min(2).max(80), issuerName: z.string().trim().max(80).optional(), issuerLogoUrl: financialBrandLogoSchema.optional(), network: z.nativeEnum(CardNetwork), lastFour: z.string().regex(/^\d{4}$/).optional(), creditLimit: money.optional(), closingDay: z.number().int().min(1).max(28).default(1), dueDay: z.number().int().min(1).max(28).default(10) });
 const cardUpdateSchema = cardSchema.partial();
 const activeSchema = z.object({ isActive: z.boolean() });
 const categorySchema = z.object({ name: z.string().trim().min(2).max(80), type: z.nativeEnum(CategoryType), color: z.string().regex(/^#[0-9A-Fa-f]{6}$/).default('#5B5BD6'), icon: z.string().trim().min(1).max(40).default('🏷️') });
@@ -18,6 +19,7 @@ const subcategorySchema = z.object({ name: z.string().trim().min(2).max(80) });
 const transactionBaseSchema = z.object({ accountId: z.string().cuid().optional(), cardId: z.string().cuid().optional(), subcategoryId: z.string().cuid(), type: z.nativeEnum(TransactionType), amount: money.positive(), description: z.string().trim().min(2).max(160), occurredOn: z.string().date(), notes: z.string().trim().max(1000).optional() });
 const transactionSchema = transactionBaseSchema.extend({ status: z.nativeEnum(TransactionStatus).default(TransactionStatus.POSTED) }).refine((data) => Boolean(data.accountId) !== Boolean(data.cardId), { message: 'Informe exatamente uma conta ou um cartão.', path: ['accountId'] });
 const transactionUpdateSchema = transactionBaseSchema.extend({ status: z.nativeEnum(TransactionStatus).optional() }).refine((data) => Boolean(data.accountId) !== Boolean(data.cardId), { message: 'Informe exatamente uma conta ou um cartão.', path: ['accountId'] });
+const occurrenceUpdateSchema = transactionBaseSchema.extend({ status: z.nativeEnum(TransactionStatus).optional(), scope: z.enum(['ONE', 'FOLLOWING']) }).refine((data) => Boolean(data.accountId) !== Boolean(data.cardId), { message: 'Informe exatamente uma conta ou um cartão.', path: ['accountId'] });
 const transactionListSchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
@@ -36,7 +38,7 @@ const transactionListSchema = z.object({
 const overviewQuerySchema = z.object({ referenceMonth: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/).optional() });
 const transferSchema = z.object({ sourceAccountId: z.string().cuid(), destinationAccountId: z.string().cuid(), amount: money.positive(), occurredOn: z.string().date(), description: z.string().trim().min(2).max(160).optional(), status: z.nativeEnum(AccountTransferStatus).default(AccountTransferStatus.POSTED) }).refine((data) => data.sourceAccountId !== data.destinationAccountId, { message: 'Origem e destino devem ser diferentes.', path: ['destinationAccountId'] });
 const paymentSchema = z.object({ accountId: z.string().cuid(), amount: money.positive(), paidOn: z.string().date(), idempotencyKey: z.string().trim().min(8).max(120) });
-const installmentSchema = z.object({ cardId: z.string().cuid(), subcategoryId: z.string().cuid(), type: z.nativeEnum(TransactionType), totalAmount: money.positive(), installmentCount: z.number().int().min(2).max(120), description: z.string().trim().min(2).max(160), firstOccurredOn: z.string().date(), notes: z.string().trim().max(1000).optional() });
+const installmentSchema = z.object({ accountId: z.string().cuid().optional(), cardId: z.string().cuid().optional(), subcategoryId: z.string().cuid(), type: z.nativeEnum(TransactionType), totalAmount: money.positive(), installmentCount: z.number().int().min(2).max(360), description: z.string().trim().min(2).max(160), firstOccurredOn: z.string().date(), notes: z.string().trim().max(1000).optional() }).refine((data) => Boolean(data.accountId) !== Boolean(data.cardId), { message: 'Informe exatamente uma conta ou um cartão.', path: ['accountId'] });
 const recurringRuleSchema = z.object({ accountId: z.string().cuid().optional(), cardId: z.string().cuid().optional(), subcategoryId: z.string().cuid(), type: z.nativeEnum(TransactionType), amount: money.positive(), description: z.string().trim().min(2).max(160), notes: z.string().trim().max(1000).optional(), startOn: z.string().date(), endOn: z.string().date().optional() }).refine((data) => Boolean(data.accountId) !== Boolean(data.cardId), { message: 'Informe exatamente uma conta ou um cartão.', path: ['accountId'] }).refine((data) => !data.endOn || data.endOn >= data.startOn, { message: 'A data final deve ser posterior à inicial.', path: ['endOn'] });
 
 @Controller('households/:householdId')
@@ -74,6 +76,10 @@ export class FinanceController {
   @Get('transactions') listTransactions(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Query() query: unknown) { return this.finance.listTransactions(user.id, householdId, transactionListSchema.parse(query)); }
   @Post('transactions') createTransaction(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Body() body: unknown) { return this.finance.createTransaction(user.id, householdId, transactionSchema.parse(body)); }
   @Patch('transactions/:transactionId') updateTransaction(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('transactionId') transactionId: string, @Body() body: unknown) { return this.finance.updateTransaction(user.id, householdId, transactionId, transactionUpdateSchema.parse(body)); }
+  @Patch('transactions/:transactionId/occurrence') updateOccurrence(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('transactionId') transactionId: string, @Body() body: unknown) {
+    const { scope, ...dto } = occurrenceUpdateSchema.parse(body);
+    return this.finance.updateOccurrence(user.id, householdId, transactionId, dto, scope);
+  }
   @Delete('transactions/:transactionId') deleteTransaction(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('transactionId') transactionId: string) { return this.finance.deleteTransaction(user.id, householdId, transactionId); }
   @Patch('transactions/:transactionId/status') setTransactionStatus(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('transactionId') transactionId: string, @Body() body: unknown) { return this.finance.setTransactionStatus(user.id, householdId, transactionId, z.object({ status: z.nativeEnum(TransactionStatus) }).parse(body).status); }
   @Get('transfers') listTransfers(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string) { return this.finance.listTransfers(user.id, householdId); }
