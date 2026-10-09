@@ -10,6 +10,7 @@ datasource db {
 enum HouseholdRole {
   OWNER
   ADMIN
+  MANAGER
   MEMBER
   VIEWER
 }
@@ -52,6 +53,11 @@ enum RecurringMaterializationMode {
   ON_OCCURRENCE_DATE
   EXERCISE_MONTH_DAY
   DAYS_BEFORE_EXERCISE_MONTH
+}
+
+enum FinancialRealizationMode {
+  MANUAL
+  ON_OCCURRENCE_DATE
 }
 
 enum SavingsGoalStatus {
@@ -194,6 +200,7 @@ model Household {
   timezone    String            @default("America/Sao_Paulo")
   recurringMaterializationMode  RecurringMaterializationMode @default(ON_OCCURRENCE_DATE)
   recurringMaterializationValue Int @default(0)
+  financialRealizationMode FinancialRealizationMode @default(MANUAL)
   createdAt   DateTime          @default(now())
   updatedAt   DateTime          @updatedAt
   members     HouseholdMember[]
@@ -209,6 +216,7 @@ model Household {
   cardPayments     CardPayment[]
   installmentPurchases InstallmentPurchase[]
   recurringRules   RecurringRule[]
+  recurringTransferRules RecurringTransferRule[]
   auditLogs        AuditLog[]
   monthlyBudgets   MonthlyBudget[]
   budgetMonths     BudgetMonth[]
@@ -242,6 +250,9 @@ model HouseholdMember {
   householdId String
   userId      String
   role        HouseholdRole @default(MEMBER)
+  displayName String?
+  isActive    Boolean       @default(true)
+  archivedAt  DateTime?
   createdAt   DateTime      @default(now())
   household   Household     @relation(fields: [householdId], references: [id], onDelete: Cascade)
   user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -282,6 +293,8 @@ model Account {
   incomingTransfers AccountTransfer[] @relation("TransferDestination")
   cardPayments   CardPayment[]
   recurringRules RecurringRule[]
+  outgoingRecurringTransfers RecurringTransferRule[] @relation("RecurringTransferSource")
+  incomingRecurringTransfers RecurringTransferRule[] @relation("RecurringTransferDestination")
   installmentPurchases InstallmentPurchase[]
   @@index([householdId])
 }
@@ -337,7 +350,8 @@ model Transaction {
   description String
   occurredOn  DateTime        @db.Date
   notes       String?
-  status      TransactionStatus @default(POSTED)
+  status      TransactionStatus @default(PENDING)
+  deletedAt   DateTime?
   importItemId String? @unique
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
@@ -366,7 +380,10 @@ model AccountTransfer {
   destinationAccountId String
   amount            Int
   occurredOn        DateTime              @db.Date
-  status            AccountTransferStatus @default(POSTED)
+  status            AccountTransferStatus @default(PENDING)
+  deletedAt         DateTime?
+  recurringTransferRuleId String?
+  recurrenceOn      DateTime? @db.Date
   description       String?
   importItemId      String?               @unique
   createdAt         DateTime              @default(now())
@@ -375,6 +392,8 @@ model AccountTransfer {
   sourceAccount     Account               @relation("TransferSource", fields: [sourceAccountId], references: [id], onDelete: Restrict)
   destinationAccount Account               @relation("TransferDestination", fields: [destinationAccountId], references: [id], onDelete: Restrict)
   importItem        ImportItem?           @relation(fields: [importItemId], references: [id], onDelete: SetNull)
+  recurringTransferRule RecurringTransferRule? @relation(fields: [recurringTransferRuleId], references: [id], onDelete: Restrict)
+  @@unique([recurringTransferRuleId, recurrenceOn])
   @@index([householdId, occurredOn])
   @@index([sourceAccountId, occurredOn])
   @@index([destinationAccountId, occurredOn])
@@ -495,6 +514,7 @@ model RecurringRule {
   amount        Int
   description   String
   notes         String?
+  excludedOccurrences Json @default("[]")
   startOn       DateTime            @db.Date
   endOn         DateTime?           @db.Date
   status        RecurringRuleStatus @default(ACTIVE)
@@ -511,6 +531,29 @@ model RecurringRule {
   successors    RecurringRule[] @relation("RecurringRuleHistory")
   @@index([householdId, status])
   @@index([predecessorId])
+}
+
+model RecurringTransferRule {
+  id String @id @default(cuid())
+  householdId String
+  sourceAccountId String
+  destinationAccountId String
+  amount Int
+  description String?
+  startOn DateTime @db.Date
+  endOn DateTime? @db.Date
+  status RecurringRuleStatus @default(ACTIVE)
+  excludedOccurrences Json @default("[]")
+  predecessorId String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  sourceAccount Account @relation("RecurringTransferSource", fields: [sourceAccountId], references: [id], onDelete: Restrict)
+  destinationAccount Account @relation("RecurringTransferDestination", fields: [destinationAccountId], references: [id], onDelete: Restrict)
+  transfers AccountTransfer[]
+  predecessor RecurringTransferRule? @relation("RecurringTransferHistory", fields: [predecessorId], references: [id], onDelete: Restrict)
+  successors RecurringTransferRule[] @relation("RecurringTransferHistory")
+  @@index([householdId, status])
 }
 
 model AuditLog {

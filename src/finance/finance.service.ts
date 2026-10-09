@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { AccountTransferStatus, AccountType, CardNetwork, CardStatementStatus, CategoryType, Prisma, RecurringMaterializationMode, RecurringRuleStatus, TransactionStatus, TransactionType } from '@prisma/client';
+import { AccountTransferStatus, AccountType, CardNetwork, CardStatementStatus, CategoryType, FinancialRealizationMode, Prisma, RecurringMaterializationMode, RecurringRuleStatus, TransactionStatus, TransactionType } from '@prisma/client';
 import { EventsService } from '../events/events.service';
 import { HouseholdsService } from '../households/households.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -17,10 +17,12 @@ type TransactionConversion =
   | { mode: 'INSTALLMENT'; accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; totalAmount: number; installmentCount: number; startInstallmentNumber?: number; description: string; notes?: string; firstOccurredOn: string };
 type TransactionListFilters = { page: number; pageSize: number; from?: string; to?: string; accountId?: string; cardId?: string; statementId?: string; recurringRuleId?: string; categoryId?: string; subcategoryId?: string; type?: TransactionType; status?: TransactionStatus; importBatchId?: string };
 type CreateTransfer = { sourceAccountId: string; destinationAccountId: string; amount: number; occurredOn: string; description?: string; status?: AccountTransferStatus };
+type RecurringTransferInput = Omit<CreateTransfer, 'occurredOn' | 'status'> & { startOn: string; endOn?: string };
+type DeleteScope = 'ONE' | 'FOLLOWING' | 'ALL';
 type StatementPayment = { accountId: string; amount: number; paidOn: string; idempotencyKey: string };
 type InstallmentPurchaseInput = { accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; totalAmount: number; installmentCount: number; startInstallmentNumber?: number; description: string; firstOccurredOn: string; notes?: string };
 type RecurringRuleInput = { accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; amount: number; description: string; notes?: string; startOn: string; endOn?: string };
-type RecurringProjectionSource = { id: string; householdId: string; accountId: string | null; cardId: string | null; subcategoryId: string; type: TransactionType; amount: number; description: string; notes: string | null; startOn: Date; endOn: Date | null; account: unknown; card: unknown; category: { id: string; name: string; color: string; icon: string }; subcategory: { id: string; name: string; categoryId: string; isDefault: boolean; isActive: boolean } };
+type RecurringProjectionSource = { id: string; householdId: string; accountId: string | null; cardId: string | null; subcategoryId: string; type: TransactionType; amount: number; description: string; notes: string | null; startOn: Date; endOn: Date | null; excludedOccurrences?: Prisma.JsonValue; account: unknown; card: unknown; category: { id: string; name: string; color: string; icon: string }; subcategory: { id: string; name: string; categoryId: string; isDefault: boolean; isActive: boolean } };
 
 @Injectable()
 export class FinanceService {
@@ -47,9 +49,9 @@ export class FinanceService {
         },
         orderBy: { name: 'asc' },
       }),
-      this.prisma.transaction.findMany({ where: { householdId, occurredOn: { gte: start, lt: end } }, include: { subcategory: { include: { category: true } }, account: true, card: true }, orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }], take: 8 }),
-      this.prisma.transaction.findMany({ where: { householdId, occurredOn: { gte: start, lt: end } }, include: { account: true, card: true, subcategory: { include: { category: true } } }, orderBy: { occurredOn: 'asc' } }),
-      this.prisma.transaction.findMany({ where: { householdId, occurredOn: { gte: previousRange.start, lt: previousRange.end } }, select: { amount: true, type: true, status: true } }),
+      this.prisma.transaction.findMany({ where: { householdId, deletedAt: null, occurredOn: { gte: start, lt: end } }, include: { subcategory: { include: { category: true } }, account: true, card: true }, orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }], take: 8 }),
+      this.prisma.transaction.findMany({ where: { householdId, deletedAt: null, occurredOn: { gte: start, lt: end } }, include: { account: true, card: true, subcategory: { include: { category: true } } }, orderBy: { occurredOn: 'asc' } }),
+      this.prisma.transaction.findMany({ where: { householdId, deletedAt: null, occurredOn: { gte: previousRange.start, lt: previousRange.end } }, select: { amount: true, type: true, status: true } }),
       this.prisma.cardStatement.findMany({ where: { householdId, status: { not: CardStatementStatus.PAID } }, include: { card: true, payments: true }, orderBy: { dueOn: 'asc' }, take: 5 }),
       this.prisma.recurringRule.findMany({ where: { householdId, status: RecurringRuleStatus.ACTIVE }, include: { account: true, card: true, category: true, subcategory: true } }),
       this.prisma.monthlyBudget.findMany({ where: { householdId, referenceMonth }, select: { categoryId: true, limitAmount: true } }),
@@ -63,14 +65,16 @@ export class FinanceService {
       const payments = account.cardPayments.reduce((sum, payment) => sum + payment.amount, 0);
       const transfersOut = account.outgoingTransfers.filter((transfer) => transfer.status === AccountTransferStatus.POSTED).reduce((sum, transfer) => sum + transfer.amount, 0);
       const transfersIn = account.incomingTransfers.filter((transfer) => transfer.status === AccountTransferStatus.POSTED).reduce((sum, transfer) => sum + transfer.amount, 0);
-      const projectedMovement = projectedRecurring.filter((item) => item.accountId === account.id).reduce((sum, item) => sum + (item.type === TransactionType.INCOME ? item.amount : -item.amount), 0);
-      return { ...account, transactions: undefined, cardPayments: undefined, outgoingTransfers: undefined, incomingTransfers: undefined, balance: account.initialBalance + movement + projectedMovement - payments - transfersOut + transfersIn };
+      return { ...account, transactions: undefined, cardPayments: undefined, outgoingTransfers: undefined, incomingTransfers: undefined, balance: account.initialBalance + movement - payments - transfersOut + transfersIn };
     });
     const monthItems = [...monthTransactions, ...projectedForMonth].sort((a, b) => a.occurredOn.getTime() - b.occurredOn.getTime());
     const posted = monthItems.filter((transaction) => transaction.status === TransactionStatus.POSTED);
     const realizedIncome = this.sumByType(posted, TransactionType.INCOME);
     const realizedExpenses = this.sumByType(posted, TransactionType.EXPENSE);
     const pendingCommitments = this.sumByType(monthItems.filter((transaction) => transaction.status === TransactionStatus.PENDING), TransactionType.EXPENSE);
+    const pendingIncome = this.sumByType(monthItems.filter((transaction) => transaction.status === TransactionStatus.PENDING), TransactionType.INCOME);
+    const availableBalance = accountSummaries.filter((account) => account.type !== AccountType.INVESTMENT).reduce((sum, account) => sum + account.balance, 0);
+    const investmentBalance = accountSummaries.filter((account) => account.type === AccountType.INVESTMENT).reduce((sum, account) => sum + account.balance, 0);
     const previousPosted = previousTransactions.filter((transaction) => transaction.status === TransactionStatus.POSTED);
     const previousIncome = this.sumByType(previousPosted, TransactionType.INCOME);
     const previousExpenses = this.sumByType(previousPosted, TransactionType.EXPENSE);
@@ -94,14 +98,15 @@ export class FinanceService {
     return {
       referenceMonth: referenceMonth.toISOString().slice(0, 7),
       isForecast: referenceMonth > this.monthStart(new Date().toISOString().slice(0, 7)),
-      totalBalance: accountSummaries.reduce((sum, account) => sum + account.balance, 0),
+      totalBalance: availableBalance,
+      investmentBalance,
       accounts: accountSummaries,
       recentTransactions: [...transactions, ...projectedForMonth].sort((a, b) => b.occurredOn.getTime() - a.occurredOn.getTime()).slice(0, 8),
       cardOpenTotal,
       pendingCommitments,
       upcomingStatements: statements,
       recurringForecast: recurringRules.map((rule) => ({ id: rule.id, amount: rule.amount, description: rule.description, startOn: rule.startOn, endOn: rule.endOn })),
-      indicators: { availableBalance: accountSummaries.reduce((sum, account) => sum + account.balance, 0), realizedIncome, realizedExpenses, pendingCommitments, cardOpenTotal, budgetCommitted: budgetSpent + pendingCommitments },
+      indicators: { availableBalance, investmentBalance, realizedIncome, realizedExpenses, pendingIncome, pendingExpenses: pendingCommitments, totalIncome: realizedIncome + pendingIncome, totalExpenses: realizedExpenses + pendingCommitments, pendingCommitments, cardOpenTotal, budgetCommitted: budgetSpent + pendingCommitments },
       comparison: { income: { current: realizedIncome, previous: previousIncome }, expenses: { current: realizedExpenses, previous: previousExpenses }, balance: { current: netFlow, previous: previousNetFlow } },
       charts: {
         weeklyFlow: weekly,
@@ -320,6 +325,7 @@ export class FinanceService {
     await this.households.assertMember(userId, householdId);
     const where: Prisma.TransactionWhereInput = {
       householdId,
+      deletedAt: null,
       accountId: filters.accountId,
       cardId: filters.cardId,
       statementId: filters.statementId,
@@ -346,7 +352,7 @@ export class FinanceService {
       projectionEnd.setUTCDate(projectionEnd.getUTCDate() + 1);
       const [persisted, recurringOccurrences, recurringRules] = await Promise.all([
         this.prisma.transaction.findMany({
-          where, include: { account: true, card: true, subcategory: { include: { category: true } } },
+          where, include: { account: true, card: true, installmentPurchase: true, statement: true, subcategory: { include: { category: true } } },
           orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }],
         }),
         this.prisma.transaction.findMany({
@@ -364,19 +370,19 @@ export class FinanceService {
         .filter((item) => this.matchesProjectedTransaction(item, filters));
       const all = [...persisted, ...projected].sort((a, b) => b.occurredOn.getTime() - a.occurredOn.getTime());
       const start = (filters.page - 1) * filters.pageSize;
-      return { items: all.slice(start, start + filters.pageSize), total: all.length, page: filters.page, pageSize: filters.pageSize };
+      return { items: all.slice(start, start + filters.pageSize).map((item) => this.transactionMetadata(item)), total: all.length, page: filters.page, pageSize: filters.pageSize };
     }
 
     const [items, total] = await this.prisma.$transaction([
       this.prisma.transaction.findMany({
-        where, include: { account: true, card: true, subcategory: { include: { category: true } } },
+        where, include: { account: true, card: true, installmentPurchase: true, statement: true, subcategory: { include: { category: true } } },
         orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }],
         skip: (filters.page - 1) * filters.pageSize,
         take: filters.pageSize,
       }),
       this.prisma.transaction.count({ where }),
     ]);
-    return { items, total, page: filters.page, pageSize: filters.pageSize };
+    return { items: items.map((item) => this.transactionMetadata(item)), total, page: filters.page, pageSize: filters.pageSize };
   }
 
   async createTransaction(userId: string, householdId: string, dto: CreateTransaction) {
@@ -397,13 +403,13 @@ export class FinanceService {
       const statement = card ? await this.statementForDate(tx, card, householdId, dto.occurredOn) : undefined;
       if (statement && statement.status !== CardStatementStatus.OPEN) throw new BadRequestException('Não é possível alterar uma fatura fechada ou paga. Registre um ajuste rastreável.');
       const transaction = await tx.transaction.create({
-        data: { householdId, ...dto, statementId: statement?.id, occurredOn: this.civilDate(dto.occurredOn) },
+        data: { householdId, ...dto, status: dto.status ?? TransactionStatus.PENDING, statementId: statement?.id, occurredOn: this.civilDate(dto.occurredOn) },
         include: { account: true, card: true, subcategory: { include: { category: true } } },
       });
-      if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
+      if (statement && transaction.status !== TransactionStatus.DISCARDED) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
       await this.events.record(tx, {
         aggregateType: 'transaction', aggregateId: transaction.id,
-        eventType: `orfina.transactions.transaction-${transaction.status === TransactionStatus.PENDING ? 'pending' : 'posted'}.v1`,
+        eventType: `orfina.transactions.transaction-${transaction.status.toLowerCase()}.v1`,
         payload: { transactionId: transaction.id, householdId, accountId: transaction.accountId, cardId: transaction.cardId, categoryId: transaction.subcategory.categoryId, type: transaction.type, status: transaction.status },
       });
       await this.audit(tx, householdId, userId, 'transaction', transaction.id, 'created', ['accountId', 'cardId', 'subcategoryId', 'type', 'amount', 'occurredOn']);
@@ -414,7 +420,7 @@ export class FinanceService {
   async updateTransaction(userId: string, householdId: string, transactionId: string, dto: CreateTransaction) {
     await this.households.assertCanWrite(userId, householdId);
     const [existing, account, card, subcategory] = await Promise.all([
-      this.prisma.transaction.findFirst({ where: { id: transactionId, householdId } }),
+      this.prisma.transaction.findFirst({ where: { id: transactionId, householdId, deletedAt: null } }),
       dto.accountId ? this.prisma.account.findFirst({ where: { id: dto.accountId, householdId, isActive: true } }) : null,
       dto.cardId ? this.prisma.card.findFirst({ where: { id: dto.cardId, householdId, isActive: true } }) : null,
       this.prisma.subcategory.findFirst({
@@ -428,6 +434,9 @@ export class FinanceService {
     if (subcategory.category.type !== dto.type) throw new BadRequestException('O tipo da categoria deve ser igual ao do lançamento.');
 
     return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "Transaction" WHERE "id" = ${transactionId} AND "householdId" = ${householdId} FOR UPDATE`;
+      const current = await tx.transaction.findFirst({ where: { id: transactionId, householdId, deletedAt: null } });
+      if (!current) throw new NotFoundException('Lançamento não encontrado neste grupo familiar.');
       if (existing.statementId) {
         const oldStatement = await tx.cardStatement.findUnique({ where: { id: existing.statementId } });
         if (oldStatement?.status !== CardStatementStatus.OPEN) throw new BadRequestException('Não é possível alterar uma fatura fechada ou paga. Registre um ajuste rastreável.');
@@ -438,6 +447,8 @@ export class FinanceService {
         where: { id: transactionId },
         data: {
           ...dto,
+          accountId: dto.accountId ?? null,
+          cardId: dto.cardId ?? null,
           statementId: statement?.id ?? null,
           occurredOn: this.civilDate(dto.occurredOn),
         },
@@ -448,8 +459,8 @@ export class FinanceService {
         eventType: 'orfina.transactions.transaction-updated.v1',
         payload: { transactionId, householdId, accountId: transaction.accountId, cardId: transaction.cardId, categoryId: transaction.subcategory.categoryId, subcategoryId: transaction.subcategoryId, type: transaction.type, amount: transaction.amount, occurredOn: transaction.occurredOn.toISOString() },
       });
-      if (existing.statementId) await this.adjustStatementTotal(tx, existing.statementId, -this.transactionImpact(existing.type, existing.amount));
-      if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
+      if (current.statementId) await this.adjustStatementTotal(tx, current.statementId, -this.billableImpact(current));
+      if (statement && transaction.status !== TransactionStatus.DISCARDED) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
       await this.audit(tx, householdId, userId, 'transaction', transactionId, 'updated', ['accountId', 'cardId', 'subcategoryId', 'type', 'amount', 'occurredOn']);
       return transaction;
     });
@@ -459,7 +470,7 @@ export class FinanceService {
   async convertTransaction(userId: string, householdId: string, transactionId: string, dto: TransactionConversion) {
     await this.households.assertCanWrite(userId, householdId);
     const [existing, account, card, subcategory] = await Promise.all([
-      this.prisma.transaction.findFirst({ where: { id: transactionId, householdId } }),
+      this.prisma.transaction.findFirst({ where: { id: transactionId, householdId, deletedAt: null } }),
       dto.accountId ? this.prisma.account.findFirst({ where: { id: dto.accountId, householdId, isActive: true } }) : null,
       dto.cardId ? this.prisma.card.findFirst({ where: { id: dto.cardId, householdId, isActive: true } }) : null,
       this.prisma.subcategory.findFirst({ where: { id: dto.subcategoryId, isActive: true, category: { householdId, isActive: true } }, include: { category: true } }),
@@ -482,8 +493,8 @@ export class FinanceService {
         if (statement && statement.status !== CardStatementStatus.OPEN) throw new BadRequestException('Não é possível incluir a ocorrência em uma fatura fechada ou paga.');
         const rule = await tx.recurringRule.create({ data: { householdId, accountId: account?.id, cardId: card?.id, categoryId: subcategory.categoryId, subcategoryId: subcategory.id, type: dto.type, amount: dto.amount, description: dto.description, notes: dto.notes, startOn: occurredOn, endOn: dto.endOn ? this.civilDate(dto.endOn) : undefined } });
         const transaction = await tx.transaction.update({ where: { id: transactionId }, data: { accountId: account?.id, cardId: card?.id, statementId: statement?.id ?? null, recurringRuleId: rule.id, recurrenceOn: occurredOn, subcategoryId: subcategory.id, type: dto.type, amount: dto.amount, description: dto.description, notes: dto.notes, occurredOn }, include: { subcategory: true } });
-        if (existing.statementId) await this.adjustStatementTotal(tx, existing.statementId, -this.transactionImpact(existing.type, existing.amount));
-        if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
+        if (existing.statementId) await this.adjustStatementTotal(tx, existing.statementId, -this.billableImpact(existing));
+        if (statement) await this.adjustStatementTotal(tx, statement.id, this.billableImpact(transaction));
         await this.events.record(tx, { aggregateType: 'recurring-rule', aggregateId: rule.id, eventType: 'orfina.recurring.rule-created.v1', payload: { ruleId: rule.id, householdId, accountId: rule.accountId, cardId: rule.cardId, amount: rule.amount, convertedTransactionId: transactionId } });
         await this.events.record(tx, { aggregateType: 'transaction', aggregateId: transactionId, eventType: 'orfina.transactions.transaction-converted.v1', payload: { transactionId, householdId, mode: dto.mode, recurringRuleId: rule.id } });
         await this.audit(tx, householdId, userId, 'transaction', transactionId, 'converted-to-recurring', ['recurringRuleId', 'accountId', 'cardId', 'subcategoryId', 'amount', 'occurredOn']);
@@ -500,8 +511,8 @@ export class FinanceService {
         const amount = installments[index];
         if (index === startInstallmentNumber - 1) {
           const transaction = await tx.transaction.update({ where: { id: transactionId }, data: { accountId: account?.id, cardId: card?.id, statementId: statement?.id ?? null, installmentPurchaseId: purchase.id, installmentNumber: index + 1, subcategoryId: subcategory.id, type: dto.type, amount, description: `${dto.description} (${index + 1}/${dto.installmentCount})`, notes: dto.notes, occurredOn } });
-          if (existing.statementId) await this.adjustStatementTotal(tx, existing.statementId, -this.transactionImpact(existing.type, existing.amount));
-          if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
+          if (existing.statementId) await this.adjustStatementTotal(tx, existing.statementId, -this.billableImpact(existing));
+          if (statement) await this.adjustStatementTotal(tx, statement.id, this.billableImpact(transaction));
         } else {
           const transaction = await tx.transaction.create({ data: { householdId, accountId: account?.id, cardId: card?.id, statementId: statement?.id, installmentPurchaseId: purchase.id, installmentNumber: index + 1, subcategoryId: subcategory.id, type: dto.type, amount, description: `${dto.description} (${index + 1}/${dto.installmentCount})`, notes: dto.notes, occurredOn } });
           if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
@@ -518,7 +529,7 @@ export class FinanceService {
   async updateOccurrence(userId: string, householdId: string, transactionId: string, dto: CreateTransaction, scope: 'ONE' | 'FOLLOWING') {
     if (scope === 'ONE') return this.updateTransaction(userId, householdId, transactionId, dto);
     await this.households.assertCanWrite(userId, householdId);
-    const existing = await this.prisma.transaction.findFirst({ where: { id: transactionId, householdId }, include: { installmentPurchase: true, recurringRule: true } });
+    const existing = await this.prisma.transaction.findFirst({ where: { id: transactionId, householdId, deletedAt: null }, include: { installmentPurchase: true, recurringRule: true } });
     if (!existing?.installmentPurchaseId && !existing?.recurringRuleId) throw new BadRequestException('Somente ocorrências de parcelamento ou recorrência podem ser alteradas a partir desta data.');
     // An installment schedule owns its source and calendar. Preserve those
     // values when changing this and following occurrences, even if a stale
@@ -535,7 +546,7 @@ export class FinanceService {
     const purchaseId = original.installmentPurchaseId!;
     const [purchase, siblings, subcategory] = await Promise.all([
       this.prisma.installmentPurchase.findFirst({ where: { id: purchaseId, householdId } }),
-      this.prisma.transaction.findMany({ where: { householdId, installmentPurchaseId: purchaseId, occurredOn: { gt: original.occurredOn } }, include: { statement: true } }),
+      this.prisma.transaction.findMany({ where: { householdId, deletedAt: null, installmentPurchaseId: purchaseId, occurredOn: { gt: original.occurredOn } }, include: { statement: true } }),
       this.prisma.subcategory.findFirst({ where: { id: updated.subcategoryId }, include: { category: true } }),
     ]);
     if (!purchase || !subcategory || !original.installmentNumber) throw new NotFoundException('Parcelamento ou subcategoria não encontrados.');
@@ -546,7 +557,7 @@ export class FinanceService {
       for (const item of siblings) {
         const description = `${baseDescription} (${item.installmentNumber}/${purchase.installmentCount})`;
         const next = await tx.transaction.update({ where: { id: item.id }, data: { subcategoryId: updated.subcategoryId, type: updated.type, amount: updated.amount, description, notes: updated.notes } });
-        if (item.statementId) await this.adjustStatementTotal(tx, item.statementId, this.transactionImpact(next.type, next.amount) - this.transactionImpact(item.type, item.amount));
+        if (item.statementId) await this.adjustStatementTotal(tx, item.statementId, this.billableImpact(next) - this.billableImpact(item));
       }
       const all = await tx.transaction.findMany({ where: { installmentPurchaseId: purchaseId }, select: { amount: true } });
       await tx.installmentPurchase.update({ where: { id: purchaseId }, data: { subcategoryId: updated.subcategoryId, categoryId: subcategory.categoryId, type: updated.type, description: baseDescription, totalAmount: all.reduce((sum, item) => sum + item.amount, 0) } });
@@ -572,14 +583,14 @@ export class FinanceService {
         successorId = successor.id;
         await tx.transaction.update({ where: { id: updated.id }, data: { recurringRuleId: successor.id, recurrenceOn: updated.occurredOn } });
       }
-      const futureOccurrences = await tx.transaction.findMany({ where: { householdId, recurringRuleId: rule.id, occurredOn: { gt: updated.occurredOn } }, include: { statement: true } });
+      const futureOccurrences = await tx.transaction.findMany({ where: { householdId, deletedAt: null, recurringRuleId: rule.id, occurredOn: { gt: updated.occurredOn } }, include: { statement: true } });
       if (futureOccurrences.some((item) => item.statement && item.statement.status !== CardStatementStatus.OPEN)) throw new BadRequestException('Não é possível alterar competências futuras já pertencentes a faturas fechadas ou pagas.');
       for (const occurrence of futureOccurrences) {
         const statement = targetCard ? await this.statementForDate(tx, targetCard, householdId, occurrence.occurredOn) : undefined;
         if (statement && statement.status !== CardStatementStatus.OPEN) throw new BadRequestException('Uma competência futura cairia em fatura fechada ou paga.');
         const next = await tx.transaction.update({ where: { id: occurrence.id }, data: { recurringRuleId: successorId, accountId: updated.accountId, cardId: updated.cardId, statementId: statement?.id ?? null, subcategoryId: updated.subcategoryId, type: updated.type, amount: updated.amount, description: updated.description, notes: updated.notes } });
-        if (occurrence.statementId) await this.adjustStatementTotal(tx, occurrence.statementId, -this.transactionImpact(occurrence.type, occurrence.amount));
-        if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(next.type, next.amount));
+        if (occurrence.statementId) await this.adjustStatementTotal(tx, occurrence.statementId, -this.billableImpact(occurrence));
+        if (statement) await this.adjustStatementTotal(tx, statement.id, this.billableImpact(next));
       }
       await this.events.record(tx, { aggregateType: 'recurring-rule', aggregateId: successorId, eventType: 'orfina.recurring.occurrences-updated.v1', payload: { householdId, previousRuleId: rule.id, ruleId: successorId, fromTransactionId: updated.id } });
       await this.audit(tx, householdId, userId, 'recurring-rule', successorId, 'occurrences-updated', ['accountId', 'cardId', 'subcategoryId', 'type', 'amount', 'description']);
@@ -587,33 +598,61 @@ export class FinanceService {
     });
   }
 
-  async deleteTransaction(userId: string, householdId: string, transactionId: string) {
+  async deleteTransaction(userId: string, householdId: string, transactionId: string, scope: DeleteScope = 'ONE') {
     await this.households.assertCanWrite(userId, householdId);
-    const transaction = await this.prisma.transaction.findFirst({ where: { id: transactionId, householdId }, include: { subcategory: true } });
-    if (!transaction) throw new NotFoundException('Lançamento não encontrado neste grupo familiar.');
     return this.prisma.$transaction(async (tx) => {
-      if (transaction.statementId) {
-        const statement = await tx.cardStatement.findUnique({ where: { id: transaction.statementId } });
-        if (statement?.status !== CardStatementStatus.OPEN) throw new BadRequestException('Não é possível apagar lançamento de fatura fechada ou paga.');
-        await this.adjustStatementTotal(tx, transaction.statementId, -this.transactionImpact(transaction.type, transaction.amount));
+      const transaction = await tx.transaction.findFirst({ where: { id: transactionId, householdId, deletedAt: null }, include: { statement: true, recurringRule: true, subcategory: true } });
+      if (!transaction) throw new NotFoundException('Lançamento não encontrado neste grupo familiar.');
+      if (transaction.statement && transaction.statement.status !== CardStatementStatus.OPEN) throw new BadRequestException('Não é possível apagar lançamento de fatura fechada ou paga.');
+      const ruleIds = transaction.recurringRuleId && scope !== 'ONE' ? this.seriesRuleIds(await tx.recurringRule.findMany({ where: { householdId }, select: { id: true, predecessorId: true } }), transaction.recurringRuleId, scope === 'ALL') : transaction.recurringRuleId ? [transaction.recurringRuleId] : [];
+      const series = transaction.recurringRuleId ? { recurringRuleId: { in: ruleIds } } : transaction.installmentPurchaseId ? { installmentPurchaseId: transaction.installmentPurchaseId } : undefined;
+      if (scope !== 'ONE' && !series) throw new BadRequestException('Este lançamento não pertence a uma série.');
+      const candidates = scope === 'ONE' ? [transaction] : await tx.transaction.findMany({ where: { householdId, deletedAt: null, ...series, ...(scope === 'FOLLOWING' ? { occurredOn: { gte: transaction.occurredOn } } : {}) }, include: { statement: true } });
+      // Series removal preserves realized history; closed invoices always remain immutable.
+      const deletable = candidates.filter((item) => (!item.statement || item.statement.status === CardStatementStatus.OPEN) && (scope === 'ONE' || item.status !== TransactionStatus.POSTED));
+      for (const item of deletable) {
+        if (item.statementId) await this.adjustStatementTotal(tx, item.statementId, -this.billableImpact(item));
+        await tx.transaction.update({ where: { id: item.id }, data: { deletedAt: new Date(), status: TransactionStatus.DISCARDED } });
+        await this.events.record(tx, { aggregateType: 'transaction', aggregateId: item.id, eventType: 'orfina.transactions.transaction-deleted.v1', payload: { transactionId: item.id, householdId, scope } });
+        await this.audit(tx, householdId, userId, 'transaction', item.id, 'deleted', ['deletedAt', 'status']);
       }
-      await tx.transaction.delete({ where: { id: transactionId } });
-      await this.events.record(tx, {
-        aggregateType: 'transaction', aggregateId: transactionId,
-        eventType: 'orfina.transactions.transaction-deleted.v1',
-        payload: { transactionId, householdId, accountId: transaction.accountId, cardId: transaction.cardId, categoryId: transaction.subcategory.categoryId, subcategoryId: transaction.subcategoryId },
-      });
-      await this.audit(tx, householdId, userId, 'transaction', transactionId, 'deleted', ['accountId', 'cardId', 'subcategoryId', 'type', 'amount']);
-      return { id: transactionId, deleted: true };
+      if (transaction.recurringRule) {
+        const recurrenceOn = transaction.recurrenceOn ?? transaction.occurredOn;
+        const exclusions = this.excludedDates(transaction.recurringRule.excludedOccurrences);
+        const data = scope === 'ONE'
+          ? { excludedOccurrences: [...new Set([...exclusions, recurrenceOn.toISOString().slice(0, 10)])] }
+          : scope === 'ALL' ? { status: RecurringRuleStatus.ENDED }
+          : { endOn: this.addDays(recurrenceOn, -1), ...(recurrenceOn <= transaction.recurringRule.startOn ? { status: RecurringRuleStatus.ENDED } : {}) };
+        await tx.recurringRule.update({ where: { id: transaction.recurringRule.id }, data });
+        await this.audit(tx, householdId, userId, 'recurring-rule', transaction.recurringRule.id, 'occurrences-deleted', Object.keys(data));
+        await this.events.record(tx, { aggregateType: 'recurring-rule', aggregateId: transaction.recurringRule.id, eventType: 'orfina.recurring.occurrences-deleted.v1', payload: { householdId, ruleId: transaction.recurringRule.id, scope, transactionId } });
+        for (const ruleId of ruleIds.filter((id) => id !== transaction.recurringRuleId)) {
+          await tx.recurringRule.update({ where: { id: ruleId }, data: { status: RecurringRuleStatus.ENDED } });
+          await this.audit(tx, householdId, userId, 'recurring-rule', ruleId, 'occurrences-deleted', ['status']);
+          await this.events.record(tx, { aggregateType: 'recurring-rule', aggregateId: ruleId, eventType: 'orfina.recurring.occurrences-deleted.v1', payload: { householdId, ruleId, scope, transactionId } });
+        }
+      }
+      if (transaction.installmentPurchaseId && scope !== 'ONE') await tx.installmentPurchase.update({ where: { id: transaction.installmentPurchaseId }, data: { canceledAt: new Date() } });
+      return { id: transactionId, deleted: deletable.some((item) => item.id === transactionId), deletedCount: deletable.length, preservedCount: candidates.length - deletable.length, scope };
     });
   }
 
   async setTransactionStatus(userId: string, householdId: string, transactionId: string, status: TransactionStatus) {
     await this.households.assertCanWrite(userId, householdId);
-    const transaction = await this.prisma.transaction.findFirst({ where: { id: transactionId, householdId } });
-    if (!transaction) throw new NotFoundException('Lançamento não encontrado neste grupo familiar.');
-    if (transaction.statementId) throw new BadRequestException('A situação de lançamento de cartão é controlada pela fatura.');
     return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "Transaction" WHERE "id" = ${transactionId} AND "householdId" = ${householdId} FOR UPDATE`;
+      const transaction = await tx.transaction.findFirst({ where: { id: transactionId, householdId, deletedAt: null }, include: { statement: true } });
+      if (!transaction) throw new NotFoundException('Lançamento não encontrado neste grupo familiar.');
+      if (transaction.statement) {
+        await this.lockCard(tx, householdId, transaction.statement.cardId);
+        const currentStatement = await tx.cardStatement.findUnique({ where: { id: transaction.statement.id } });
+        if (currentStatement?.status !== CardStatementStatus.OPEN) throw new BadRequestException('Não é possível alterar lançamento de fatura fechada ou paga.');
+      }
+      if (transaction.statementId && transaction.status !== status) {
+        const previousImpact = transaction.status === TransactionStatus.DISCARDED ? 0 : this.transactionImpact(transaction.type, transaction.amount);
+        const nextImpact = status === TransactionStatus.DISCARDED ? 0 : this.transactionImpact(transaction.type, transaction.amount);
+        if (previousImpact !== nextImpact) await this.adjustStatementTotal(tx, transaction.statementId, nextImpact - previousImpact);
+      }
       const updated = await tx.transaction.update({ where: { id: transactionId }, data: { status }, include: { account: true, card: true, subcategory: { include: { category: true } } } });
       await this.events.record(tx, { aggregateType: 'transaction', aggregateId: transactionId, eventType: 'orfina.transactions.status-changed.v1', payload: { householdId, transactionId, status } });
       await this.audit(tx, householdId, userId, 'transaction', transactionId, 'status-changed', ['status']);
@@ -621,9 +660,19 @@ export class FinanceService {
     });
   }
 
-  async listTransfers(userId: string, householdId: string) {
+  async listTransfers(userId: string, householdId: string, filters: { from?: string; to?: string } = {}) {
     await this.households.assertMember(userId, householdId);
-    return this.prisma.accountTransfer.findMany({ where: { householdId }, include: { sourceAccount: true, destinationAccount: true, importItem: { select: { batchId: true } } }, orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }] });
+    const persisted = await this.prisma.accountTransfer.findMany({ where: { householdId, deletedAt: null, ...(filters.from || filters.to ? { occurredOn: { ...(filters.from ? { gte: this.civilDate(filters.from) } : {}), ...(filters.to ? { lte: this.civilDate(filters.to) } : {}) } } : {}) }, include: { sourceAccount: true, destinationAccount: true, importItem: { select: { batchId: true } } }, orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }] });
+    if (!filters.from || !filters.to) return persisted.map((item) => ({ ...item, mode: item.recurringTransferRuleId ? 'FIXED' : 'SINGLE', isForecast: false }));
+    const [rules, occupied] = await Promise.all([
+      this.prisma.recurringTransferRule.findMany({ where: { householdId, status: RecurringRuleStatus.ACTIVE }, include: { sourceAccount: true, destinationAccount: true } }),
+      this.prisma.accountTransfer.findMany({ where: { householdId, recurringTransferRuleId: { not: null } }, select: { recurringTransferRuleId: true, recurrenceOn: true } }),
+    ]);
+    const existing = new Set(occupied.map((item) => `${item.recurringTransferRuleId}:${item.recurrenceOn?.toISOString().slice(0, 10)}`));
+    const forecast = rules.flatMap((rule) => this.recurringDates(rule.startOn, rule.endOn, this.addDays(this.civilDate(filters.to!), 1))
+      .filter((date) => date >= this.civilDate(filters.from!) && !this.excludedDates(rule.excludedOccurrences).includes(date.toISOString().slice(0, 10)) && !existing.has(`${rule.id}:${date.toISOString().slice(0, 10)}`))
+      .map((occurredOn) => ({ id: `transfer-forecast:${rule.id}:${occurredOn.toISOString().slice(0, 10)}`, householdId, recurringTransferRuleId: rule.id, sourceAccountId: rule.sourceAccountId, destinationAccountId: rule.destinationAccountId, sourceAccount: rule.sourceAccount, destinationAccount: rule.destinationAccount, amount: rule.amount, description: rule.description, occurredOn, recurrenceOn: occurredOn, status: AccountTransferStatus.PENDING, mode: 'FIXED', isForecast: true })));
+    return [...persisted.map((item) => ({ ...item, mode: item.recurringTransferRuleId ? 'FIXED' : 'SINGLE', isForecast: false })), ...forecast].sort((a, b) => b.occurredOn.getTime() - a.occurredOn.getTime());
   }
 
   async createTransfer(userId: string, householdId: string, dto: CreateTransfer) {
@@ -632,7 +681,7 @@ export class FinanceService {
     const accounts = await this.prisma.account.count({ where: { householdId, isActive: true, id: { in: [dto.sourceAccountId, dto.destinationAccountId] } } });
     if (accounts !== 2) throw new NotFoundException('As contas da transferência devem ser ativas e pertencer ao grupo familiar.');
     return this.prisma.$transaction(async (tx) => {
-      const transfer = await tx.accountTransfer.create({ data: { householdId, ...dto, occurredOn: this.civilDate(dto.occurredOn), status: dto.status ?? AccountTransferStatus.POSTED }, include: { sourceAccount: true, destinationAccount: true } });
+      const transfer = await tx.accountTransfer.create({ data: { householdId, ...dto, occurredOn: this.civilDate(dto.occurredOn), status: dto.status ?? AccountTransferStatus.PENDING }, include: { sourceAccount: true, destinationAccount: true } });
       await this.events.record(tx, { aggregateType: 'transfer', aggregateId: transfer.id, eventType: 'orfina.transfers.transfer-created.v1', payload: { householdId, transferId: transfer.id, status: transfer.status } });
       await this.audit(tx, householdId, userId, 'transfer', transfer.id, 'created', ['sourceAccountId', 'destinationAccountId', 'status']);
       return transfer;
@@ -641,12 +690,217 @@ export class FinanceService {
 
   async setTransferStatus(userId: string, householdId: string, transferId: string, status: AccountTransferStatus) {
     await this.households.assertCanManage(userId, householdId);
-    const transfer = await this.prisma.accountTransfer.findFirst({ where: { id: transferId, householdId } });
+    const transfer = await this.prisma.accountTransfer.findFirst({ where: { id: transferId, householdId, deletedAt: null } });
     if (!transfer) throw new NotFoundException('Transferência não encontrada neste grupo familiar.');
     return this.prisma.$transaction(async (tx) => {
       const updated = await tx.accountTransfer.update({ where: { id: transferId }, data: { status } });
       await this.events.record(tx, { aggregateType: 'transfer', aggregateId: transferId, eventType: 'orfina.transfers.transfer-status-changed.v1', payload: { householdId, transferId, status } });
       await this.audit(tx, householdId, userId, 'transfer', transferId, 'status-changed', ['status']);
+      return updated;
+    });
+  }
+
+  async listRecurringTransferRules(userId: string, householdId: string) {
+    await this.households.assertMember(userId, householdId);
+    return this.prisma.recurringTransferRule.findMany({ where: { householdId }, include: { sourceAccount: true, destinationAccount: true }, orderBy: { createdAt: 'desc' } });
+  }
+
+  private async validateTransferAccounts(householdId: string, dto: { sourceAccountId: string; destinationAccountId: string }) {
+    if (dto.sourceAccountId === dto.destinationAccountId) throw new BadRequestException('Origem e destino devem ser diferentes.');
+    const count = await this.prisma.account.count({ where: { householdId, isActive: true, id: { in: [dto.sourceAccountId, dto.destinationAccountId] } } });
+    if (count !== 2) throw new NotFoundException('As contas devem ser ativas e pertencer ao grupo familiar.');
+  }
+
+  async createRecurringTransferRule(userId: string, householdId: string, dto: RecurringTransferInput) {
+    await this.households.assertCanManage(userId, householdId);
+    await this.validateTransferAccounts(householdId, dto);
+    return this.prisma.$transaction(async (tx) => {
+      const rule = await tx.recurringTransferRule.create({ data: { householdId, ...dto, startOn: this.civilDate(dto.startOn), endOn: dto.endOn ? this.civilDate(dto.endOn) : undefined }, include: { sourceAccount: true, destinationAccount: true } });
+      await this.events.record(tx, { aggregateType: 'recurring-transfer-rule', aggregateId: rule.id, eventType: 'orfina.transfers.recurring-rule-created.v1', payload: { householdId, ruleId: rule.id } });
+      await this.audit(tx, householdId, userId, 'recurring-transfer-rule', rule.id, 'created', ['sourceAccountId', 'destinationAccountId', 'amount', 'startOn']);
+      return rule;
+    });
+  }
+
+  async setRecurringTransferRuleStatus(userId: string, householdId: string, ruleId: string, status: RecurringRuleStatus) {
+    await this.households.assertCanManage(userId, householdId);
+    const rule = await this.prisma.recurringTransferRule.findFirst({ where: { id: ruleId, householdId } });
+    if (!rule) throw new NotFoundException('Recorrência de transferência não encontrada.');
+    return this.prisma.$transaction(async (tx) => {
+      const updated = await tx.recurringTransferRule.update({ where: { id: ruleId }, data: { status } });
+      await this.events.record(tx, { aggregateType: 'recurring-transfer-rule', aggregateId: ruleId, eventType: 'orfina.transfers.recurring-rule-status-changed.v1', payload: { householdId, ruleId, status } });
+      await this.audit(tx, householdId, userId, 'recurring-transfer-rule', ruleId, 'status-changed', ['status']);
+      return updated;
+    });
+  }
+
+  /** Editing the schedule creates a version; realized occurrences retain their original values and sources. */
+  async updateRecurringTransferRule(userId: string, householdId: string, ruleId: string, dto: RecurringTransferInput) {
+    await this.households.assertCanManage(userId, householdId);
+    await this.validateTransferAccounts(householdId, dto);
+    const startOn = this.civilDate(dto.startOn);
+    const endOn = dto.endOn ? this.civilDate(dto.endOn) : null;
+    if (endOn && endOn < startOn) throw new BadRequestException('A data final deve ser posterior à inicial.');
+    return this.prisma.$transaction(async (tx) => {
+      const rule = await tx.recurringTransferRule.findFirst({ where: { id: ruleId, householdId } });
+      if (!rule) throw new NotFoundException('Recorrência de transferência não encontrada.');
+      if (rule.status === RecurringRuleStatus.ENDED) throw new BadRequestException('Uma versão encerrada não pode ser editada. Edite a versão vigente.');
+      const ruleIds = this.seriesRuleIds(await tx.recurringTransferRule.findMany({ where: { householdId }, select: { id: true, predecessorId: true } }), ruleId, false);
+      // A changed calendar day still represents the same monthly occurrence.
+      const occurrences = await tx.accountTransfer.findMany({ where: { householdId, recurringTransferRuleId: { in: ruleIds }, deletedAt: null, occurredOn: { gte: this.monthStart(dto.startOn.slice(0, 7)) } } });
+      const retained = occurrences.filter((item) => item.status === AccountTransferStatus.POSTED);
+      const preservedDates = retained.map((item) => this.addMonths(startOn, (item.occurredOn.getUTCFullYear() - startOn.getUTCFullYear()) * 12 + item.occurredOn.getUTCMonth() - startOn.getUTCMonth()).toISOString().slice(0, 10));
+      const excludedDates = this.excludedDates(rule.excludedOccurrences).filter((date) => date.slice(0, 7) >= dto.startOn.slice(0, 7)).map((date) => {
+        const original = this.civilDate(date);
+        return this.addMonths(startOn, (original.getUTCFullYear() - startOn.getUTCFullYear()) * 12 + original.getUTCMonth() - startOn.getUTCMonth()).toISOString().slice(0, 10);
+      });
+      const successor = await tx.recurringTransferRule.create({ data: { householdId, predecessorId: rule.id, sourceAccountId: dto.sourceAccountId, destinationAccountId: dto.destinationAccountId, amount: dto.amount, description: dto.description, startOn, endOn, status: rule.status, excludedOccurrences: [...new Set([...excludedDates, ...preservedDates])] }, include: { sourceAccount: true, destinationAccount: true } });
+      for (const id of ruleIds) {
+        await tx.recurringTransferRule.update({ where: { id }, data: { status: RecurringRuleStatus.ENDED } });
+        await this.audit(tx, householdId, userId, 'recurring-transfer-rule', id, 'superseded', ['status']);
+        await this.events.record(tx, { aggregateType: 'recurring-transfer-rule', aggregateId: id, eventType: 'orfina.transfers.recurring-rule-superseded.v1', payload: { householdId, ruleId: id, successorRuleId: successor.id } });
+      }
+      const pending = occurrences.filter((item) => item.status !== AccountTransferStatus.POSTED);
+      for (const item of pending) {
+        await tx.accountTransfer.update({ where: { id: item.id }, data: { deletedAt: new Date(), status: AccountTransferStatus.DISCARDED } });
+        await this.audit(tx, householdId, userId, 'transfer', item.id, 'superseded', ['deletedAt', 'status']);
+        await this.events.record(tx, { aggregateType: 'transfer', aggregateId: item.id, eventType: 'orfina.transfers.transfer-superseded.v1', payload: { householdId, transferId: item.id, successorRuleId: successor.id } });
+      }
+      await this.audit(tx, householdId, userId, 'recurring-transfer-rule', successor.id, 'schedule-updated', Object.keys(dto));
+      await this.events.record(tx, { aggregateType: 'recurring-transfer-rule', aggregateId: successor.id, eventType: 'orfina.transfers.recurring-rule-split.v1', payload: { householdId, predecessorId: rule.id, ruleId: successor.id, startOn: dto.startOn, preservedCount: retained.length, supersededCount: pending.length } });
+      return successor;
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+  }
+
+  /** Rule-level deletion also covers virtual occurrences which have no transfer ID yet. */
+  async deleteRecurringTransferRule(userId: string, householdId: string, ruleId: string, scope: DeleteScope = 'ALL', occurrenceInput?: string) {
+    await this.households.assertCanManage(userId, householdId);
+    if (scope !== 'ALL' && !occurrenceInput) throw new BadRequestException('Informe a ocorrência para este escopo.');
+    return this.prisma.$transaction(async (tx) => {
+      const rule = await tx.recurringTransferRule.findFirst({ where: { id: ruleId, householdId } });
+      if (!rule) throw new NotFoundException('Recorrência de transferência não encontrada.');
+      const occurredOn = occurrenceInput ? this.civilDate(occurrenceInput) : null;
+      if (scope !== 'ALL' && (!occurredOn || !this.isRecurringOccurrence(rule.startOn, rule.endOn, occurredOn))) throw new BadRequestException('A data não corresponde a uma ocorrência desta regra.');
+      const ruleIds = scope === 'ONE' ? [rule.id] : this.seriesRuleIds(await tx.recurringTransferRule.findMany({ where: { householdId }, select: { id: true, predecessorId: true } }), rule.id, scope === 'ALL');
+      const candidates = await tx.accountTransfer.findMany({ where: { householdId, recurringTransferRuleId: { in: ruleIds }, deletedAt: null, ...(scope === 'ONE' ? { recurrenceOn: occurredOn } : scope === 'FOLLOWING' ? { occurredOn: { gte: occurredOn! } } : {}) } });
+      if (scope === 'ONE' && candidates.some((item) => item.status === AccountTransferStatus.POSTED)) throw new BadRequestException('Para excluir uma transferência realizada, selecione o lançamento correspondente.');
+      const pending = candidates.filter((item) => item.status !== AccountTransferStatus.POSTED);
+      for (const item of pending) {
+        await tx.accountTransfer.update({ where: { id: item.id }, data: { deletedAt: new Date(), status: AccountTransferStatus.DISCARDED } });
+        await this.audit(tx, householdId, userId, 'transfer', item.id, 'deleted', ['deletedAt', 'status']);
+        await this.events.record(tx, { aggregateType: 'transfer', aggregateId: item.id, eventType: 'orfina.transfers.transfer-deleted.v1', payload: { householdId, transferId: item.id, scope } });
+      }
+      for (const id of ruleIds) {
+        const data = scope === 'ONE' ? { excludedOccurrences: [...new Set([...this.excludedDates(rule.excludedOccurrences), occurrenceInput!])] }
+          : scope === 'FOLLOWING' && id === rule.id && occurredOn! > this.civilDate(rule.startOn) ? { endOn: this.addDays(occurredOn!, -1) }
+          : { status: RecurringRuleStatus.ENDED };
+        await tx.recurringTransferRule.update({ where: { id }, data });
+        await this.audit(tx, householdId, userId, 'recurring-transfer-rule', id, 'occurrences-deleted', Object.keys(data));
+        await this.events.record(tx, { aggregateType: 'recurring-transfer-rule', aggregateId: id, eventType: 'orfina.transfers.recurring-occurrences-deleted.v1', payload: { householdId, ruleId: id, scope, occurredOn: occurrenceInput ?? null } });
+      }
+      return { id: ruleId, scope, deletedCount: pending.length, preservedCount: candidates.length - pending.length };
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+  }
+
+  async materializeRecurringTransferOccurrence(userId: string, householdId: string, ruleId: string, date: string) {
+    await this.households.assertCanManage(userId, householdId);
+    const rule = await this.prisma.recurringTransferRule.findFirst({ where: { id: ruleId, householdId, status: RecurringRuleStatus.ACTIVE } });
+    if (!rule) throw new NotFoundException('Recorrência de transferência ativa não encontrada.');
+    const occurredOn = this.civilDate(date);
+    if (!this.isRecurringOccurrence(rule.startOn, rule.endOn, occurredOn) || this.excludedDates(rule.excludedOccurrences).includes(date)) throw new BadRequestException('A data não corresponde a uma ocorrência disponível.');
+    await this.validateTransferAccounts(householdId, rule);
+    return this.prisma.$transaction(async (tx) => {
+      const existing = await tx.accountTransfer.findUnique({ where: { recurringTransferRuleId_recurrenceOn: { recurringTransferRuleId: rule.id, recurrenceOn: occurredOn } } });
+      if (existing) return existing;
+      const transfer = await tx.accountTransfer.create({ data: { householdId, recurringTransferRuleId: rule.id, recurrenceOn: occurredOn, sourceAccountId: rule.sourceAccountId, destinationAccountId: rule.destinationAccountId, amount: rule.amount, description: rule.description, occurredOn, status: AccountTransferStatus.PENDING }, include: { sourceAccount: true, destinationAccount: true } });
+      await this.events.record(tx, { aggregateType: 'transfer', aggregateId: transfer.id, eventType: 'orfina.transfers.transfer-created.v1', payload: { householdId, transferId: transfer.id, ruleId: rule.id, status: transfer.status } });
+      await this.audit(tx, householdId, userId, 'transfer', transfer.id, 'materialized', ['recurringTransferRuleId', 'recurrenceOn']);
+      return transfer;
+    });
+  }
+
+  private async materializeRecurringTransfers(today: Date) {
+    const rules = await this.prisma.recurringTransferRule.findMany({ where: { status: RecurringRuleStatus.ACTIVE, sourceAccount: { isActive: true }, destinationAccount: { isActive: true } }, include: { household: true } });
+    let generated = 0;
+    for (const rule of rules) {
+      for (const occurredOn of this.recurringDates(rule.startOn, rule.endOn, this.addMonths(today, 2))) {
+        if (this.excludedDates(rule.excludedOccurrences).includes(occurredOn.toISOString().slice(0, 10)) || this.recurringLaunchOn(occurredOn, rule.household.recurringMaterializationMode, rule.household.recurringMaterializationValue) > today) continue;
+        await this.prisma.$transaction(async (tx) => {
+          const exists = await tx.accountTransfer.findUnique({ where: { recurringTransferRuleId_recurrenceOn: { recurringTransferRuleId: rule.id, recurrenceOn: occurredOn } } });
+          if (exists) return;
+          const transfer = await tx.accountTransfer.create({ data: { householdId: rule.householdId, sourceAccountId: rule.sourceAccountId, destinationAccountId: rule.destinationAccountId, recurringTransferRuleId: rule.id, recurrenceOn: occurredOn, amount: rule.amount, description: rule.description, occurredOn, status: AccountTransferStatus.PENDING } });
+          await this.events.record(tx, { aggregateType: 'transfer', aggregateId: transfer.id, eventType: 'orfina.transfers.transfer-created.v1', payload: { householdId: rule.householdId, transferId: transfer.id, ruleId: rule.id, status: transfer.status } });
+          await this.audit(tx, rule.householdId, null, 'transfer', transfer.id, 'materialized', ['recurringTransferRuleId', 'recurrenceOn']);
+          generated += 1;
+        });
+      }
+    }
+    return generated;
+  }
+
+  async deleteTransfer(userId: string, householdId: string, transferId: string, scope: DeleteScope = 'ONE') {
+    await this.households.assertCanManage(userId, householdId);
+    return this.prisma.$transaction(async (tx) => {
+      const transfer = await tx.accountTransfer.findFirst({ where: { id: transferId, householdId, deletedAt: null }, include: { recurringTransferRule: true } });
+      if (!transfer) throw new NotFoundException('Transferência não encontrada.');
+      if (scope !== 'ONE' && !transfer.recurringTransferRule) throw new BadRequestException('Esta transferência não pertence a uma série.');
+      const ruleIds = transfer.recurringTransferRuleId && scope !== 'ONE' ? this.seriesRuleIds(await tx.recurringTransferRule.findMany({ where: { householdId }, select: { id: true, predecessorId: true } }), transfer.recurringTransferRuleId, scope === 'ALL') : transfer.recurringTransferRuleId ? [transfer.recurringTransferRuleId] : [];
+      const candidates = scope === 'ONE' ? [transfer] : await tx.accountTransfer.findMany({ where: { householdId, deletedAt: null, recurringTransferRuleId: { in: ruleIds }, ...(scope === 'FOLLOWING' ? { occurredOn: { gte: transfer.occurredOn } } : {}) } });
+      const deletable = candidates.filter((item) => scope === 'ONE' || item.status !== AccountTransferStatus.POSTED);
+      for (const item of deletable) {
+        await tx.accountTransfer.update({ where: { id: item.id }, data: { deletedAt: new Date(), status: AccountTransferStatus.DISCARDED } });
+        await this.events.record(tx, { aggregateType: 'transfer', aggregateId: item.id, eventType: 'orfina.transfers.transfer-deleted.v1', payload: { householdId, transferId: item.id, scope } });
+        await this.audit(tx, householdId, userId, 'transfer', item.id, 'deleted', ['deletedAt', 'status']);
+      }
+      if (transfer.recurringTransferRule) {
+        const rule = transfer.recurringTransferRule;
+        const recurrenceOn = transfer.recurrenceOn ?? transfer.occurredOn;
+        const data = scope === 'ONE' ? { excludedOccurrences: [...new Set([...this.excludedDates(rule.excludedOccurrences), recurrenceOn.toISOString().slice(0, 10)])] }
+          : scope === 'ALL' || recurrenceOn <= rule.startOn ? { status: RecurringRuleStatus.ENDED }
+          : { endOn: this.addDays(recurrenceOn, -1) };
+        await tx.recurringTransferRule.update({ where: { id: rule.id }, data });
+        await this.events.record(tx, { aggregateType: 'recurring-transfer-rule', aggregateId: rule.id, eventType: 'orfina.transfers.recurring-occurrences-deleted.v1', payload: { householdId, ruleId: rule.id, scope } });
+        await this.audit(tx, householdId, userId, 'recurring-transfer-rule', rule.id, 'occurrences-deleted', Object.keys(data));
+        for (const ruleId of ruleIds.filter((id) => id !== rule.id)) {
+          await tx.recurringTransferRule.update({ where: { id: ruleId }, data: { status: RecurringRuleStatus.ENDED } });
+          await this.audit(tx, householdId, userId, 'recurring-transfer-rule', ruleId, 'occurrences-deleted', ['status']);
+          await this.events.record(tx, { aggregateType: 'recurring-transfer-rule', aggregateId: ruleId, eventType: 'orfina.transfers.recurring-occurrences-deleted.v1', payload: { householdId, ruleId, scope } });
+        }
+      }
+      return { id: transferId, deleted: deletable.some((item) => item.id === transferId), deletedCount: deletable.length, preservedCount: candidates.length - deletable.length, scope };
+    });
+  }
+
+  async updateTransfer(userId: string, householdId: string, transferId: string, dto: CreateTransfer, scope: DeleteScope = 'ONE') {
+    await this.households.assertCanManage(userId, householdId);
+    await this.validateTransferAccounts(householdId, dto);
+    return this.prisma.$transaction(async (tx) => {
+      const current = await tx.accountTransfer.findFirst({ where: { id: transferId, householdId, deletedAt: null }, include: { recurringTransferRule: true } });
+      if (!current) throw new NotFoundException('Transferência não encontrada.');
+      if (scope === 'ALL') throw new BadRequestException('Use uma ocorrência ou esta e as seguintes para preservar o histórico.');
+      if (scope === 'FOLLOWING' && !current.recurringTransferRule) throw new BadRequestException('Esta transferência não pertence a uma série.');
+      if (scope === 'FOLLOWING' && current.status === AccountTransferStatus.POSTED) throw new BadRequestException('Escolha uma ocorrência pendente para alterar a série.');
+      let updated = await tx.accountTransfer.update({ where: { id: transferId }, data: { ...dto, occurredOn: this.civilDate(dto.occurredOn) }, include: { sourceAccount: true, destinationAccount: true } });
+      if (scope === 'FOLLOWING' && current.recurringTransferRule) {
+        const rule = current.recurringTransferRule;
+        const boundary = current.recurrenceOn ?? current.occurredOn;
+        const realizedFuture = await tx.accountTransfer.findMany({ where: { householdId, recurringTransferRuleId: rule.id, deletedAt: null, status: AccountTransferStatus.POSTED, occurredOn: { gt: current.occurredOn } }, select: { occurredOn: true } });
+        const preservedDates = realizedFuture.map((item) => this.addMonths(dto.occurredOn, (item.occurredOn.getUTCFullYear() - boundary.getUTCFullYear()) * 12 + item.occurredOn.getUTCMonth() - boundary.getUTCMonth()).toISOString().slice(0, 10));
+        await tx.recurringTransferRule.update({ where: { id: rule.id }, data: boundary <= rule.startOn ? { status: RecurringRuleStatus.ENDED } : { endOn: this.addDays(boundary, -1) } });
+        const successor = await tx.recurringTransferRule.create({ data: { householdId, predecessorId: rule.id, sourceAccountId: dto.sourceAccountId, destinationAccountId: dto.destinationAccountId, amount: dto.amount, description: dto.description, startOn: this.civilDate(dto.occurredOn), endOn: rule.endOn, excludedOccurrences: [...new Set([...this.excludedDates(rule.excludedOccurrences).filter((date) => date >= boundary.toISOString().slice(0, 10)), ...preservedDates])] } });
+        updated = await tx.accountTransfer.update({ where: { id: transferId }, data: { recurringTransferRuleId: successor.id, recurrenceOn: this.civilDate(dto.occurredOn) }, include: { sourceAccount: true, destinationAccount: true } });
+        // Remove future pending materializations; successor generates the changed calendar.
+        const future = await tx.accountTransfer.findMany({ where: { householdId, recurringTransferRuleId: rule.id, deletedAt: null, status: { not: AccountTransferStatus.POSTED }, occurredOn: { gt: current.occurredOn } } });
+        for (const item of future) {
+          await tx.accountTransfer.update({ where: { id: item.id }, data: { deletedAt: new Date(), status: AccountTransferStatus.DISCARDED } });
+          await this.audit(tx, householdId, userId, 'transfer', item.id, 'superseded', ['deletedAt', 'status']);
+          await this.events.record(tx, { aggregateType: 'transfer', aggregateId: item.id, eventType: 'orfina.transfers.transfer-superseded.v1', payload: { householdId, transferId: item.id, successorRuleId: successor.id } });
+        }
+        await this.events.record(tx, { aggregateType: 'recurring-transfer-rule', aggregateId: successor.id, eventType: 'orfina.transfers.recurring-rule-split.v1', payload: { householdId, predecessorId: rule.id, ruleId: successor.id, transferId } });
+        await this.audit(tx, householdId, userId, 'recurring-transfer-rule', successor.id, 'split', ['predecessorId', 'startOn']);
+      }
+      await this.events.record(tx, { aggregateType: 'transfer', aggregateId: transferId, eventType: 'orfina.transfers.transfer-updated.v1', payload: { householdId, transferId, scope } });
+      await this.audit(tx, householdId, userId, 'transfer', transferId, 'updated', Object.keys(dto));
       return updated;
     });
   }
@@ -668,6 +922,11 @@ export class FinanceService {
     if (!statement) throw new NotFoundException('Fatura não encontrada neste grupo familiar.');
     if (statement.status !== CardStatementStatus.OPEN) throw new BadRequestException('Esta fatura já foi fechada ou paga.');
     return this.prisma.$transaction(async (tx) => {
+      await this.lockCard(tx, householdId, statement.cardId);
+      const current = await tx.cardStatement.findUnique({ where: { id: statementId } });
+      if (current?.status !== CardStatementStatus.OPEN) throw new BadRequestException('Esta fatura já foi fechada ou paga.');
+      const pending = await tx.transaction.count({ where: { householdId, statementId, deletedAt: null, status: TransactionStatus.PENDING } });
+      if (pending) throw new BadRequestException('Realize ou descarte os lançamentos pendentes antes de fechar a fatura.');
       const closed = await tx.cardStatement.update({ where: { id: statementId }, data: { status: CardStatementStatus.CLOSED, closedAt: new Date() } });
       await this.events.record(tx, { aggregateType: 'card-statement', aggregateId: statementId, eventType: 'orfina.cards.statement-closed.v1', payload: { statementId, cardId: statement.cardId, householdId, totalAmount: closed.totalAmount } });
       await this.audit(tx, householdId, userId, 'card-statement', statementId, 'closed', ['status', 'closedAt']);
@@ -735,13 +994,14 @@ export class FinanceService {
     if (!purchase) throw new NotFoundException('Compra parcelada não encontrada neste grupo familiar.');
     if (purchase.canceledAt) throw new BadRequestException('As parcelas futuras desta compra já foram canceladas.');
     const today = this.civilDate(new Date());
-    const deletable = purchase.transactions.filter((transaction) => transaction.occurredOn > today && (!transaction.statement || transaction.statement.status === CardStatementStatus.OPEN));
+    const deletable = purchase.transactions.filter((transaction) => !transaction.deletedAt && transaction.status !== TransactionStatus.POSTED && transaction.occurredOn > today && (!transaction.statement || transaction.statement.status === CardStatementStatus.OPEN));
     const blocked = purchase.transactions.filter((transaction) => transaction.occurredOn > today && transaction.statement && transaction.statement.status !== CardStatementStatus.OPEN);
     if (blocked.length) throw new BadRequestException('Não é possível cancelar parcelas que já pertencem a fatura fechada ou paga.');
     return this.prisma.$transaction(async (tx) => {
       for (const transaction of deletable) {
-        if (transaction.statementId) await this.adjustStatementTotal(tx, transaction.statementId, -this.transactionImpact(transaction.type, transaction.amount));
-        await tx.transaction.delete({ where: { id: transaction.id } });
+        if (transaction.statementId) await this.adjustStatementTotal(tx, transaction.statementId, -this.billableImpact(transaction));
+        await tx.transaction.update({ where: { id: transaction.id }, data: { deletedAt: new Date(), status: TransactionStatus.DISCARDED } });
+        await this.audit(tx, householdId, userId, 'transaction', transaction.id, 'deleted', ['deletedAt', 'status']);
       }
       const updated = await tx.installmentPurchase.update({ where: { id: purchaseId }, data: { canceledAt: new Date() } });
       await this.events.record(tx, { aggregateType: 'installment-purchase', aggregateId: purchaseId, eventType: 'orfina.installments.future-installments-canceled.v1', payload: { purchaseId, householdId, canceledCount: deletable.length } });
@@ -759,7 +1019,7 @@ export class FinanceService {
     await this.households.assertMember(userId, householdId);
     return this.prisma.installmentPurchase.findMany({
       where: { householdId },
-      include: { account: true, card: true, transactions: { include: { statement: true }, orderBy: { installmentNumber: 'asc' } } },
+      include: { account: true, card: true, transactions: { where: { deletedAt: null }, include: { statement: true }, orderBy: { installmentNumber: 'asc' } } },
       orderBy: { createdAt: 'desc' },
     });
   }
@@ -788,6 +1048,7 @@ export class FinanceService {
     if (!rule || rule.status !== RecurringRuleStatus.ACTIVE) throw new NotFoundException('Recorrência ativa não encontrada neste grupo familiar.');
     const occurredOn = this.civilDate(occurredOnInput);
     if (!this.isRecurringOccurrence(rule.startOn, rule.endOn, occurredOn)) throw new BadRequestException('A data informada não corresponde a uma ocorrência desta recorrência.');
+    if (this.excludedDates(rule.excludedOccurrences).includes(occurredOnInput)) throw new BadRequestException('Esta ocorrência foi excluída da recorrência.');
 
     return this.prisma.$transaction(async (tx) => {
       const existing = await tx.transaction.findUnique({
@@ -802,7 +1063,7 @@ export class FinanceService {
           householdId, accountId: rule.accountId, cardId: rule.cardId, statementId: statement?.id,
           recurringRuleId: rule.id, recurrenceOn: occurredOn, subcategoryId: rule.subcategoryId,
           type: rule.type, amount: rule.amount, description: rule.description, notes: rule.notes,
-          occurredOn, status: occurredOn <= this.civilDate(new Date()) ? TransactionStatus.POSTED : TransactionStatus.PENDING,
+          occurredOn, status: TransactionStatus.PENDING,
         },
         include: { account: true, card: true, subcategory: { include: { category: true } } },
       });
@@ -826,20 +1087,22 @@ export class FinanceService {
   }
 
   /** Called by the worker; uniqueness on (recurringRuleId, recurrenceOn) makes retries safe. */
-  async materializeRecurringRules(today = this.civilDate(new Date())) {
+  async materializeRecurringRules(asOf?: Date) {
+    const today = asOf ?? this.civilDate(new Date());
     const rules = await this.prisma.recurringRule.findMany({ where: { status: RecurringRuleStatus.ACTIVE }, include: { card: true, household: { select: { recurringMaterializationMode: true, recurringMaterializationValue: true } } } });
     let generated = 0;
     for (const rule of rules) {
       // The greatest advance is 28 days before a month; two civil months safely covers short months and month-end dates.
       const generationHorizon = this.addMonths(today, 2);
-      for (let occurredOn = new Date(rule.startOn); occurredOn <= generationHorizon && (!rule.endOn || occurredOn <= rule.endOn); occurredOn = this.addMonths(occurredOn, 1)) {
+      for (const occurredOn of this.recurringDates(rule.startOn, rule.endOn, generationHorizon)) {
+        if (this.excludedDates(rule.excludedOccurrences).includes(occurredOn.toISOString().slice(0, 10))) continue;
         if (this.recurringLaunchOn(occurredOn, rule.household.recurringMaterializationMode, rule.household.recurringMaterializationValue) > today) continue;
         const made = await this.prisma.$transaction(async (tx) => {
           const existing = await tx.transaction.findUnique({ where: { recurringRuleId_recurrenceOn: { recurringRuleId: rule.id, recurrenceOn: occurredOn } } });
           if (existing) return false;
           const statement = rule.card ? await this.statementForDate(tx, rule.card, rule.householdId, occurredOn) : undefined;
           if (statement && statement.status !== CardStatementStatus.OPEN) return false;
-          const transaction = await tx.transaction.create({ data: { householdId: rule.householdId, accountId: rule.accountId, cardId: rule.cardId, statementId: statement?.id, recurringRuleId: rule.id, recurrenceOn: occurredOn, subcategoryId: rule.subcategoryId, type: rule.type, amount: rule.amount, description: rule.description, notes: rule.notes, occurredOn, status: occurredOn <= today ? TransactionStatus.POSTED : TransactionStatus.PENDING } });
+          const transaction = await tx.transaction.create({ data: { householdId: rule.householdId, accountId: rule.accountId, cardId: rule.cardId, statementId: statement?.id, recurringRuleId: rule.id, recurrenceOn: occurredOn, subcategoryId: rule.subcategoryId, type: rule.type, amount: rule.amount, description: rule.description, notes: rule.notes, occurredOn, status: TransactionStatus.PENDING } });
           if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
           await this.events.record(tx, { aggregateType: 'recurring-occurrence', aggregateId: transaction.id, eventType: 'orfina.recurring.occurrence-created.v1', payload: { ruleId: rule.id, transactionId: transaction.id, householdId: rule.householdId, occurredOn: occurredOn.toISOString() } });
           await this.audit(tx, rule.householdId, null, 'recurring-occurrence', transaction.id, 'created', ['recurringRuleId', 'occurredOn']);
@@ -847,16 +1110,48 @@ export class FinanceService {
         });
         if (made) generated += 1;
       }
-      await this.prisma.transaction.updateMany({ where: { householdId: rule.householdId, recurringRuleId: rule.id, status: TransactionStatus.PENDING, occurredOn: { lte: today } }, data: { status: TransactionStatus.POSTED } });
     }
+    generated += await this.materializeRecurringTransfers(today);
+    await this.realizeDueFinancialEntries(asOf);
     return generated;
+  }
+
+  /** Realization policy applies to all entries, including standalone, installments and paused rules. */
+  async realizeDueFinancialEntries(asOf?: Date) {
+    const households = await this.prisma.household.findMany({ where: { financialRealizationMode: FinancialRealizationMode.ON_OCCURRENCE_DATE }, select: { id: true, timezone: true } });
+    let realized = 0;
+    for (const household of households) {
+      const today = asOf ? this.civilDate(asOf) : this.todayInTimezone(household.timezone);
+      const entries = await this.prisma.transaction.findMany({ where: { householdId: household.id, deletedAt: null, status: TransactionStatus.PENDING, occurredOn: { lte: today }, OR: [{ statementId: null }, { statement: { status: CardStatementStatus.OPEN } }] }, select: { id: true } });
+      for (const entry of entries) {
+        await this.prisma.$transaction(async (tx) => {
+          const updated = await tx.transaction.updateMany({ where: { id: entry.id, householdId: household.id, household: { financialRealizationMode: FinancialRealizationMode.ON_OCCURRENCE_DATE }, deletedAt: null, status: TransactionStatus.PENDING, OR: [{ statementId: null }, { statement: { status: CardStatementStatus.OPEN } }] }, data: { status: TransactionStatus.POSTED } });
+          if (!updated.count) return;
+          await this.events.record(tx, { aggregateType: 'transaction', aggregateId: entry.id, eventType: 'orfina.transactions.status-changed.v1', payload: { householdId: household.id, transactionId: entry.id, status: TransactionStatus.POSTED, automatic: true } });
+          await this.audit(tx, household.id, null, 'transaction', entry.id, 'automatically-realized', ['status']);
+          realized += 1;
+        });
+      }
+      const transfers = await this.prisma.accountTransfer.findMany({ where: { householdId: household.id, deletedAt: null, status: AccountTransferStatus.PENDING, occurredOn: { lte: today } }, select: { id: true } });
+      for (const transfer of transfers) {
+        await this.prisma.$transaction(async (tx) => {
+          const updated = await tx.accountTransfer.updateMany({ where: { id: transfer.id, householdId: household.id, household: { financialRealizationMode: FinancialRealizationMode.ON_OCCURRENCE_DATE }, deletedAt: null, status: AccountTransferStatus.PENDING }, data: { status: AccountTransferStatus.POSTED } });
+          if (!updated.count) return;
+          await this.events.record(tx, { aggregateType: 'transfer', aggregateId: transfer.id, eventType: 'orfina.transfers.transfer-status-changed.v1', payload: { householdId: household.id, transferId: transfer.id, status: AccountTransferStatus.POSTED, automatic: true } });
+          await this.audit(tx, household.id, null, 'transfer', transfer.id, 'automatically-realized', ['status']);
+          realized += 1;
+        });
+      }
+    }
+    return realized;
   }
 
   /** Builds read-only future occurrences; persistence remains the worker's responsibility. */
   private projectRecurringOccurrences(rules: RecurringProjectionSource[], end: Date, existing: Set<string>) {
     const projected: Array<{ id: string; recurringRuleId: string; accountId: string | null; cardId: string | null; account: unknown; card: unknown; subcategoryId: string; subcategory: { id: string; name: string; categoryId: string; isDefault: boolean; isActive: boolean; category: RecurringProjectionSource['category'] }; type: TransactionType; amount: number; description: string; notes: string | null; occurredOn: Date; status: TransactionStatus; isForecast: boolean }> = [];
     for (const rule of rules) {
-      for (let occurredOn = new Date(rule.startOn); occurredOn < end && (!rule.endOn || occurredOn <= rule.endOn); occurredOn = this.addMonths(occurredOn, 1)) {
+      for (const occurredOn of this.recurringDates(rule.startOn, rule.endOn, end)) {
+        if (this.excludedDates(rule.excludedOccurrences).includes(occurredOn.toISOString().slice(0, 10))) continue;
         const key = `${rule.id}:${occurredOn.toISOString().slice(0, 10)}`;
         if (existing.has(key)) continue;
         projected.push({ id: `forecast:${rule.id}:${occurredOn.toISOString().slice(0, 10)}`, recurringRuleId: rule.id, accountId: rule.accountId, cardId: rule.cardId, account: rule.account, card: rule.card, subcategoryId: rule.subcategoryId, subcategory: { ...rule.subcategory, category: rule.category }, type: rule.type, amount: rule.amount, description: rule.description, notes: rule.notes, occurredOn, status: TransactionStatus.PENDING, isForecast: true });
@@ -885,7 +1180,41 @@ export class FinanceService {
     return months >= 0 && this.addMonths(startOn, months).toISOString().slice(0, 10) === occurredOn.toISOString().slice(0, 10);
   }
 
+  private excludedDates(value?: Prisma.JsonValue): string[] {
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+  }
+
+  private seriesRuleIds(rules: { id: string; predecessorId: string | null }[], ruleId: string, includeAncestors: boolean) {
+    const ids = new Set([ruleId]);
+    let added = true;
+    while (added) {
+      added = false;
+      for (const rule of rules) {
+        if (rule.predecessorId && (ids.has(rule.predecessorId) || (includeAncestors && ids.has(rule.id)))) {
+          for (const id of [rule.id, rule.predecessorId]) if (!ids.has(id)) { ids.add(id); added = true; }
+        }
+      }
+    }
+    return [...ids];
+  }
+
+  private recurringDates(startOn: Date, endOn: Date | null, horizon: Date) {
+    const dates: Date[] = [];
+    const start = this.civilDate(startOn);
+    for (let month = 0; ; month += 1) {
+      const date = this.addMonths(start, month);
+      if (date >= horizon || (endOn && date > this.civilDate(endOn))) break;
+      dates.push(date);
+    }
+    return dates;
+  }
+
+  private transactionMetadata<T extends { recurringRuleId?: string | null; installmentPurchaseId?: string | null; installmentNumber?: number | null; installmentPurchase?: { installmentCount: number; startInstallmentNumber: number } | null; statement?: { status: CardStatementStatus } | null; isForecast?: boolean }>(item: T) {
+    return { ...item, mode: item.installmentPurchaseId ? 'INSTALLMENT' : item.recurringRuleId ? 'FIXED' : 'SINGLE', installmentCount: item.installmentPurchase?.installmentCount ?? null, startInstallmentNumber: item.installmentPurchase?.startInstallmentNumber ?? null, statementStatus: item.statement?.status ?? null, isForecast: item.isForecast ?? false };
+  }
+
   private async statementForDate(tx: Prisma.TransactionClient, card: { id: string; closingDay: number; dueDay: number }, householdId: string, occurredOn: string | Date) {
+    await this.lockCard(tx, householdId, card.id);
     const date = this.civilDate(occurredOn);
     const year = date.getUTCFullYear();
     const month = date.getUTCMonth();
@@ -897,7 +1226,12 @@ export class FinanceService {
   }
 
   private async adjustStatementTotal(tx: Prisma.TransactionClient, statementId: string, amount: number) {
-    await tx.cardStatement.update({ where: { id: statementId }, data: { totalAmount: { increment: amount } } });
+    const changed = await tx.cardStatement.updateMany({ where: { id: statementId, status: CardStatementStatus.OPEN }, data: { totalAmount: { increment: amount } } });
+    if (!changed.count) throw new BadRequestException('Não é possível alterar uma fatura fechada ou paga.');
+  }
+
+  private async lockCard(tx: Prisma.TransactionClient, householdId: string, cardId: string) {
+    await tx.$queryRaw`SELECT "id" FROM "Card" WHERE "id" = ${cardId} AND "householdId" = ${householdId} FOR UPDATE`;
   }
 
   private async audit(tx: Prisma.TransactionClient, householdId: string, actorId: string | null, aggregateType: string, aggregateId: string, action: string, changedFields: string[]) {
@@ -905,6 +1239,10 @@ export class FinanceService {
   }
 
   private transactionImpact(type: TransactionType, amount: number) { return type === TransactionType.INCOME ? -amount : amount; }
+
+  private billableImpact(item: { type: TransactionType; amount: number; status: TransactionStatus }) {
+    return item.status === TransactionStatus.DISCARDED ? 0 : this.transactionImpact(item.type, item.amount);
+  }
 
   private sumByType(items: { amount: number; type: TransactionType }[], type: TransactionType) {
     return items.filter((item) => item.type === type).reduce((sum, item) => sum + item.amount, 0);
@@ -923,6 +1261,12 @@ export class FinanceService {
   private civilDate(value: string | Date) {
     const raw = typeof value === 'string' ? value.slice(0, 10) : value.toISOString().slice(0, 10);
     return new Date(`${raw}T12:00:00.000Z`);
+  }
+
+  private todayInTimezone(timezone: string) {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
+    const part = (type: string) => parts.find((item) => item.type === type)!.value;
+    return this.civilDate(`${part('year')}-${part('month')}-${part('day')}`);
   }
 
   private addMonths(value: string | Date, months: number) {

@@ -38,7 +38,7 @@ export class AuthController {
     }
   }
   @Get('me') @UseGuards(JwtAuthGuard)
-  me(@CurrentUser() user: AuthenticatedUser) { return { id: user.id, email: user.email, name: user.name, systemRole: user.systemRole }; }
+  me(@CurrentUser() user: AuthenticatedUser) { return { id: user.id, email: user.email, name: user.name, avatarUrl: user.avatarUrl, systemRole: user.systemRole }; }
   @Post('refresh')
   async refresh(@Req() req: FastifyRequest, @Res({ passthrough: true }) reply: FastifyReply) {
     const refreshToken = readCookie(req.headers.cookie, cookieName('refresh'));

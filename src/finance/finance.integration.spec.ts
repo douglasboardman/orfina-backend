@@ -95,9 +95,9 @@ integration('Finance integration (PostgreSQL)', () => {
     const specific = await finance.createSubcategory(ownerId, householdId, category.id, { name: 'Específica preservada' });
     const account = await finance.createAccount(ownerId, householdId, { name: 'Conta união', type: 'CHECKING', initialBalance: 0 });
     const card = await finance.createCard(ownerId, householdId, { name: 'Cartão união', network: CardNetwork.VISA });
-    const movement = await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: duplicate.id, type: TransactionType.EXPENSE, amount: 750, description: 'Lançamento preservado', occurredOn: '2026-10-04' });
-    await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: automatic.id, type: TransactionType.EXPENSE, amount: 250, description: 'Outro lançamento', occurredOn: '2026-10-04' });
-    await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: specific.id, type: TransactionType.EXPENSE, amount: 125, description: 'Outra subcategoria', occurredOn: '2026-10-04' });
+    const movement = await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: duplicate.id, type: TransactionType.EXPENSE, amount: 750, description: 'Lançamento preservado', occurredOn: '2026-10-04', status: 'POSTED' });
+    await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: automatic.id, type: TransactionType.EXPENSE, amount: 250, description: 'Outro lançamento', occurredOn: '2026-10-04', status: 'POSTED' });
+    await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: specific.id, type: TransactionType.EXPENSE, amount: 125, description: 'Outra subcategoria', occurredOn: '2026-10-04', status: 'POSTED' });
     await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: specific.id, type: TransactionType.EXPENSE, amount: 75, description: 'Pendente preservado', occurredOn: '2026-10-04', status: 'PENDING' });
     const purchase = await finance.createInstallmentPurchase(ownerId, householdId, { cardId: card.id, subcategoryId: duplicate.id, type: TransactionType.EXPENSE, totalAmount: 600, installmentCount: 2, description: 'Parcelada preservada', firstOccurredOn: '2026-12-04' });
     const rule = await finance.createRecurringRule(ownerId, householdId, { accountId: account.id, subcategoryId: duplicate.id, type: TransactionType.EXPENSE, amount: 100, description: 'Recorrência preservada', startOn: '2026-12-04' });
@@ -163,7 +163,7 @@ integration('Finance integration (PostgreSQL)', () => {
     const expense = await finance.createCategory(ownerId, householdId, { name: 'Assinaturas', type: 'EXPENSE', color: '#5B5BD6', icon: 'receipt_long' });
     const expenseSubcategory = await finance.createSubcategory(ownerId, householdId, expense.id, { name: 'Streaming' });
     const card = await finance.createCard(ownerId, householdId, { name: 'Cartão ciclo', network: CardNetwork.VISA, closingDay: 10, dueDay: 5 });
-    await finance.createTransaction(ownerId, householdId, { cardId: card.id, subcategoryId: expenseSubcategory.id, type: TransactionType.EXPENSE, amount: 1_250, description: 'Compra no cartão', occurredOn: '2026-10-11' });
+    await finance.createTransaction(ownerId, householdId, { cardId: card.id, subcategoryId: expenseSubcategory.id, type: TransactionType.EXPENSE, amount: 1_250, description: 'Compra no cartão', occurredOn: '2026-10-11', status: 'POSTED' });
 
     const [statement] = await finance.listCardStatements(ownerId, householdId, card.id);
     expect(statement.totalAmount).toBe(1_250);
@@ -206,8 +206,10 @@ integration('Finance integration (PostgreSQL)', () => {
     const rule = await finance.createRecurringRule(ownerId, householdId, { accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, amount: 400, description: 'Conta antecipada', startOn: '2026-11-08' });
     await finance.materializeRecurringRules(new Date('2026-10-22T12:00:00.000Z'));
     expect(await prisma.transaction.findUnique({ where: { recurringRuleId_recurrenceOn: { recurringRuleId: rule.id, recurrenceOn: new Date('2026-11-08T12:00:00.000Z') } } })).toMatchObject({ status: 'PENDING' });
+    await households.updateSettings(ownerId, householdId, { financialRealizationMode: 'ON_OCCURRENCE_DATE' });
     await finance.materializeRecurringRules(new Date('2026-11-08T12:00:00.000Z'));
     expect(await prisma.transaction.findUnique({ where: { recurringRuleId_recurrenceOn: { recurringRuleId: rule.id, recurrenceOn: new Date('2026-11-08T12:00:00.000Z') } } })).toMatchObject({ status: 'POSTED' });
+    await households.updateSettings(ownerId, householdId, { financialRealizationMode: 'MANUAL' });
   });
 
   it('projects a missing fixed occurrence in its month and materializes it idempotently before editing', async () => {
@@ -230,7 +232,7 @@ integration('Finance integration (PostgreSQL)', () => {
     expect(await prisma.transaction.count({ where: { householdId, recurringRuleId: rule.id, recurrenceOn: new Date('2026-11-09T12:00:00.000Z') } })).toBe(1);
     const persisted = (await finance.listTransactions(ownerId, householdId, { page: 1, pageSize: 20, from: '2026-11-01', to: '2026-11-30' })).items.find((item) => item.id === first.id);
     expect(persisted).toBeDefined();
-    expect('isForecast' in persisted!).toBe(false);
+    expect(persisted!.isForecast).toBe(false);
   });
 
   it('converts only standalone transactions into recurring rules or installment purchases without duplication', async () => {
@@ -284,7 +286,7 @@ integration('Finance integration (PostgreSQL)', () => {
     const account = await finance.createAccount(ownerId, householdId, { name: 'Conta orçamento', type: 'CHECKING', initialBalance: 0 });
     const category = await finance.createCategory(ownerId, householdId, { name: `Orçamento ${suffix}`, type: 'EXPENSE', color: '#5B5BD6', icon: 'sell' });
     const subcategory = await finance.createSubcategory(ownerId, householdId, category.id, { name: 'Despesa planejada' });
-    await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, amount: 750, description: 'Consumo do orçamento', occurredOn: '2026-10-04' });
+    await finance.createTransaction(ownerId, householdId, { accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, amount: 750, description: 'Consumo do orçamento', occurredOn: '2026-10-04', status: 'POSTED' });
     await planning.upsertBudget(ownerId, householdId, '2026-10', { categoryId: category.id, limitAmount: 1_000 });
     const summary = await planning.budgetSummary(ownerId, householdId, '2026-10');
     expect(summary.rows.find((row) => row.categoryId === category.id)).toEqual(expect.objectContaining({ spentAmount: 750, availableAmount: 250 }));
@@ -307,7 +309,7 @@ integration('Finance integration (PostgreSQL)', () => {
     const subcategory = await finance.createSubcategory(ownerId, householdId, category.id, { name: 'Revisada' });
 
     await finance.createTransaction(ownerId, householdId, { accountId: source.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, amount: 1_500, description: 'Pendente', occurredOn: '2026-10-02', status: 'PENDING' as never });
-    await finance.createTransfer(ownerId, householdId, { sourceAccountId: source.id, destinationAccountId: destination.id, amount: 2_000, occurredOn: '2026-10-02' });
+    await finance.createTransfer(ownerId, householdId, { sourceAccountId: source.id, destinationAccountId: destination.id, amount: 2_000, occurredOn: '2026-10-02', status: 'POSTED' });
     const balances = await finance.listAccounts(ownerId, householdId);
     expect(balances.find((account) => account.id === source.id)?.balance).toBe(8_000);
     expect(balances.find((account) => account.id === destination.id)?.balance).toBe(2_000);
@@ -321,5 +323,170 @@ integration('Finance integration (PostgreSQL)', () => {
     expect(retriedPreview.id).toBe(preview.id);
     expect((await finance.listTransactions(ownerId, householdId, { page: 1, pageSize: 100, importBatchId: preview.id })).items).toHaveLength(1);
     expect((await finance.overview(ownerId, householdId)).pendingCommitments).toBeGreaterThanOrEqual(2_734);
+  });
+
+  it('defaults every new financial entry to pending and realizes all sources only under the household policy', async () => {
+    const source = await finance.createAccount(ownerId, householdId, { name: `Realização ${suffix}`, type: 'CHECKING', initialBalance: 10_000 });
+    const destination = await finance.createAccount(ownerId, householdId, { name: `Realização destino ${suffix}`, type: 'SAVINGS', initialBalance: 0 });
+    const expense = await finance.createCategory(ownerId, householdId, { name: `Realização despesa ${suffix}`, type: 'EXPENSE', color: '#123456' });
+    const income = await finance.createCategory(ownerId, householdId, { name: `Realização receita ${suffix}`, type: 'INCOME', color: '#654321' });
+    const card = await finance.createCard(ownerId, householdId, { name: `Realização cartão ${suffix}`, network: 'VISA' });
+    const base = { accountId: source.id, subcategoryId: expense.subcategories[0].id, type: TransactionType.EXPENSE, amount: 100, description: 'Realização avulsa', occurredOn: '2026-10-01' };
+    const standalone = await finance.createTransaction(ownerId, householdId, base);
+    const salary = await finance.createTransaction(ownerId, householdId, { ...base, subcategoryId: income.subcategories[0].id, type: 'INCOME' });
+    const cardExpense = await finance.createTransaction(ownerId, householdId, { ...base, accountId: undefined, cardId: card.id });
+    const future = await finance.createTransaction(ownerId, householdId, { ...base, occurredOn: '2027-01-01' });
+    const discarded = await finance.createTransaction(ownerId, householdId, { ...base, status: 'DISCARDED' });
+    const purchase = await finance.createInstallmentPurchase(ownerId, householdId, { accountId: source.id, subcategoryId: expense.subcategories[0].id, type: 'EXPENSE', totalAmount: 300, installmentCount: 3, description: 'Realização parcelada', firstOccurredOn: '2026-10-01' });
+    const transfer = await finance.createTransfer(ownerId, householdId, { sourceAccountId: source.id, destinationAccountId: destination.id, amount: 200, occurredOn: '2026-10-01' });
+    const rule = await finance.createRecurringRule(ownerId, householdId, { accountId: source.id, subcategoryId: expense.subcategories[0].id, type: 'EXPENSE', amount: 100, description: 'Realização fixa', startOn: '2026-10-01' });
+    const fixed = await finance.materializeRecurringOccurrence(ownerId, householdId, rule.id, '2026-10-01');
+    expect([standalone, salary, cardExpense, future, fixed, transfer].every((item) => item.status === 'PENDING')).toBe(true);
+    await finance.realizeDueFinancialEntries(new Date('2026-10-02T12:00:00.000Z'));
+    expect((await prisma.transaction.findUniqueOrThrow({ where: { id: standalone.id } })).status).toBe('PENDING');
+    expect((await finance.listAccounts(ownerId, householdId)).find((account) => account.id === source.id)?.balance).toBe(10_000);
+    await households.updateSettings(ownerId, householdId, { financialRealizationMode: 'ON_OCCURRENCE_DATE' });
+    await finance.realizeDueFinancialEntries(new Date('2026-10-02T12:00:00.000Z'));
+    for (const item of [standalone, salary, cardExpense, fixed]) expect((await prisma.transaction.findUniqueOrThrow({ where: { id: item.id } })).status).toBe('POSTED');
+    expect((await prisma.accountTransfer.findUniqueOrThrow({ where: { id: transfer.id } })).status).toBe('POSTED');
+    const installments = await prisma.transaction.findMany({ where: { installmentPurchaseId: purchase.id }, orderBy: { installmentNumber: 'asc' } });
+    expect(installments.map((item) => item.status)).toEqual(['POSTED', 'PENDING', 'PENDING']);
+    expect((await prisma.transaction.findUniqueOrThrow({ where: { id: future.id } })).status).toBe('PENDING');
+    expect((await prisma.transaction.findUniqueOrThrow({ where: { id: discarded.id } })).status).toBe('DISCARDED');
+    expect(await prisma.auditLog.count({ where: { householdId, aggregateId: standalone.id, action: 'automatically-realized' } })).toBe(1);
+    await finance.realizeDueFinancialEntries(new Date('2026-10-02T12:00:00.000Z'));
+    expect(await prisma.auditLog.count({ where: { householdId, aggregateId: standalone.id, action: 'automatically-realized' } })).toBe(1);
+    await households.updateSettings(ownerId, householdId, { financialRealizationMode: 'MANUAL' });
+  });
+
+  it('allows status changes only in open invoices, updates discarded totals and blocks closing pending entries', async () => {
+    const category = await finance.createCategory(ownerId, householdId, { name: `Status cartão ${suffix}`, type: 'EXPENSE', color: '#123456' });
+    const card = await finance.createCard(ownerId, householdId, { name: `Status fatura ${suffix}`, network: 'VISA' });
+    const movement = await finance.createTransaction(ownerId, householdId, { cardId: card.id, subcategoryId: category.subcategories[0].id, type: 'EXPENSE', amount: 250, description: 'Compra pendente', occurredOn: '2026-10-02' });
+    const statementId = movement.statementId!;
+    await expect(finance.closeStatement(ownerId, householdId, statementId)).rejects.toBeInstanceOf(BadRequestException);
+    await finance.setTransactionStatus(ownerId, householdId, movement.id, 'DISCARDED');
+    expect((await prisma.cardStatement.findUniqueOrThrow({ where: { id: statementId } })).totalAmount).toBe(0);
+    await finance.setTransactionStatus(ownerId, householdId, movement.id, 'POSTED');
+    expect((await prisma.cardStatement.findUniqueOrThrow({ where: { id: statementId } })).totalAmount).toBe(250);
+    await finance.closeStatement(ownerId, householdId, statementId);
+    await expect(finance.setTransactionStatus(ownerId, householdId, movement.id, 'PENDING')).rejects.toBeInstanceOf(BadRequestException);
+    await expect(finance.deleteTransaction(ownerId, householdId, movement.id)).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('excludes investments and forecasts from liquidity and exposes pending and realized totals', async () => {
+    const liquid = await finance.createAccount(ownerId, householdId, { name: `Liquidez ${suffix}`, type: 'CHECKING', initialBalance: 5_000 });
+    const invested = await finance.createAccount(ownerId, householdId, { name: `Investido ${suffix}`, type: 'INVESTMENT', initialBalance: 10_000 });
+    const category = await finance.createCategory(ownerId, householdId, { name: `Previsão liquidez ${suffix}`, type: 'EXPENSE', color: '#123456' });
+    const base = await finance.overview(ownerId, householdId, '2028-10');
+    await finance.createRecurringRule(ownerId, householdId, { accountId: liquid.id, subcategoryId: category.subcategories[0].id, type: 'EXPENSE', amount: 900, description: 'Previsão futura', startOn: '2028-10-01' });
+    const transfer = await finance.createTransfer(ownerId, householdId, { sourceAccountId: liquid.id, destinationAccountId: invested.id, amount: 1_000, occurredOn: '2028-10-02' });
+    const pending = await finance.overview(ownerId, householdId, '2028-10');
+    expect(pending.indicators.availableBalance).toBe(base.indicators.availableBalance);
+    expect(pending.indicators.pendingExpenses).toBeGreaterThanOrEqual(900);
+    expect(pending.accounts.find((account) => account.id === liquid.id)?.balance).toBe(5_000);
+    await finance.setTransferStatus(ownerId, householdId, transfer.id, 'POSTED');
+    const posted = await finance.overview(ownerId, householdId, '2028-10');
+    expect(posted.indicators.availableBalance).toBe(base.indicators.availableBalance - 1_000);
+    expect(posted.indicators.investmentBalance).toBe(base.indicators.investmentBalance + 1_000);
+    expect(posted.totalBalance).toBe(posted.indicators.availableBalance);
+  });
+
+  it('deletes series scopes without regenerating exceptions and preserves realized installment history', async () => {
+    const account = await finance.createAccount(ownerId, householdId, { name: `Exclusão ${suffix}`, type: 'CHECKING', initialBalance: 0 });
+    const category = await finance.createCategory(ownerId, householdId, { name: `Série exclusão ${suffix}`, type: 'EXPENSE', color: '#123456' });
+    const subcategoryId = category.subcategories[0].id;
+    const rule = await finance.createRecurringRule(ownerId, householdId, { accountId: account.id, subcategoryId, type: 'EXPENSE', amount: 100, description: 'Excluir fixa', startOn: '2027-01-31' });
+    const january = await finance.materializeRecurringOccurrence(ownerId, householdId, rule.id, '2027-01-31');
+    await finance.deleteTransaction(ownerId, householdId, january.id, 'ONE');
+    await expect(finance.materializeRecurringOccurrence(ownerId, householdId, rule.id, '2027-01-31')).rejects.toBeInstanceOf(BadRequestException);
+    const ledger = await finance.listTransactions(ownerId, householdId, { page: 1, pageSize: 100, from: '2027-01-01', to: '2027-03-31', recurringRuleId: rule.id });
+    expect(ledger.items.map((item) => item.occurredOn.toISOString().slice(0, 10))).toEqual(['2027-03-31', '2027-02-28']);
+    const february = await finance.materializeRecurringOccurrence(ownerId, householdId, rule.id, '2027-02-28');
+    await finance.deleteTransaction(ownerId, householdId, february.id, 'FOLLOWING');
+    expect((await finance.listTransactions(ownerId, householdId, { page: 1, pageSize: 100, from: '2027-01-01', to: '2027-12-31', recurringRuleId: rule.id })).items).toHaveLength(0);
+    const purchase = await finance.createInstallmentPurchase(ownerId, householdId, { accountId: account.id, subcategoryId, type: 'EXPENSE', totalAmount: 300, installmentCount: 3, description: 'Excluir parcelas', firstOccurredOn: '2027-01-01' });
+    const items = await prisma.transaction.findMany({ where: { installmentPurchaseId: purchase.id }, orderBy: { installmentNumber: 'asc' } });
+    await finance.setTransactionStatus(ownerId, householdId, items[0].id, 'POSTED');
+    const result = await finance.deleteTransaction(ownerId, householdId, items[1].id, 'ALL');
+    expect(result).toMatchObject({ deletedCount: 2, preservedCount: 1 });
+    expect((await prisma.transaction.findUniqueOrThrow({ where: { id: items[0].id } })).status).toBe('POSTED');
+    expect(await prisma.transaction.count({ where: { installmentPurchaseId: purchase.id } })).toBe(3);
+    const preserved = (await finance.listTransactions(ownerId, householdId, { page: 1, pageSize: 100 })).items.find((item) => item.id === items[0].id);
+    expect(preserved).toMatchObject({ mode: 'INSTALLMENT', installmentCount: 3, installmentNumber: 1 });
+  });
+
+  it('projects and materializes recurring transfers once and preserves realized history on deletion', async () => {
+    const source = await finance.createAccount(ownerId, householdId, { name: `Transferência fixa ${suffix}`, type: 'CHECKING', initialBalance: 1_000 });
+    const destination = await finance.createAccount(ownerId, householdId, { name: `Transferência fixa destino ${suffix}`, type: 'INVESTMENT', initialBalance: 0 });
+    const rule = await finance.createRecurringTransferRule(ownerId, householdId, { sourceAccountId: source.id, destinationAccountId: destination.id, amount: 100, description: 'Aporte mensal', startOn: '2028-01-31' });
+    await expect(finance.createRecurringTransferRule(outsiderId, householdId, { sourceAccountId: source.id, destinationAccountId: destination.id, amount: 100, startOn: '2028-01-31' })).rejects.toBeInstanceOf(ForbiddenException);
+    const forecast = await finance.listTransfers(ownerId, householdId, { from: '2028-02-01', to: '2028-03-31' });
+    expect(forecast.filter((item) => item.recurringTransferRuleId === rule.id).map((item) => item.occurredOn.toISOString().slice(0, 10))).toEqual(['2028-03-31', '2028-02-29']);
+    const january = await finance.materializeRecurringTransferOccurrence(ownerId, householdId, rule.id, '2028-01-31');
+    expect((await finance.materializeRecurringTransferOccurrence(ownerId, householdId, rule.id, '2028-01-31')).id).toBe(january.id);
+    await finance.setTransferStatus(ownerId, householdId, january.id, 'POSTED');
+    const february = await finance.materializeRecurringTransferOccurrence(ownerId, householdId, rule.id, '2028-02-29');
+    await finance.deleteTransfer(ownerId, householdId, february.id, 'ALL');
+    expect((await prisma.accountTransfer.findUniqueOrThrow({ where: { id: january.id } })).status).toBe('POSTED');
+    expect((await finance.listTransfers(ownerId, householdId, { from: '2028-01-01', to: '2028-12-31' })).filter((item) => item.recurringTransferRuleId === rule.id)).toHaveLength(1);
+  });
+
+  it('splits transfer edits atomically and deletes the entire historical rule chain while preserving realized entries', async () => {
+    const source = await finance.createAccount(ownerId, householdId, { name: `Editar transferência ${suffix}`, type: 'CHECKING', initialBalance: 1_000 });
+    const destination = await finance.createAccount(ownerId, householdId, { name: `Editar transferência destino ${suffix}`, type: 'INVESTMENT', initialBalance: 0 });
+    const rule = await finance.createRecurringTransferRule(ownerId, householdId, { sourceAccountId: source.id, destinationAccountId: destination.id, amount: 100, description: 'Aporte original', startOn: '2028-01-01' });
+    const first = await finance.materializeRecurringTransferOccurrence(ownerId, householdId, rule.id, '2028-01-01');
+    const following = await finance.materializeRecurringTransferOccurrence(ownerId, householdId, rule.id, '2028-02-01');
+    const third = await finance.materializeRecurringTransferOccurrence(ownerId, householdId, rule.id, '2028-03-01');
+    await finance.setTransferStatus(ownerId, householdId, first.id, 'POSTED');
+    const changed = await finance.updateTransfer(ownerId, householdId, following.id, { sourceAccountId: source.id, destinationAccountId: destination.id, amount: 250, description: 'Aporte ajustado', occurredOn: '2028-02-01' }, 'FOLLOWING');
+    expect(changed.recurringTransferRuleId).not.toBe(rule.id);
+    expect((await prisma.accountTransfer.findUniqueOrThrow({ where: { id: third.id } })).deletedAt).not.toBeNull();
+    const march = (await finance.listTransfers(ownerId, householdId, { from: '2028-03-01', to: '2028-03-31' })).find((item) => item.recurringTransferRuleId === changed.recurringTransferRuleId);
+    expect(march).toMatchObject({ amount: 250, isForecast: true });
+    await finance.deleteTransfer(ownerId, householdId, changed.id, 'ALL');
+    expect(await prisma.recurringTransferRule.count({ where: { householdId, id: { in: [rule.id, changed.recurringTransferRuleId!] }, status: 'ACTIVE' } })).toBe(0);
+    expect((await prisma.accountTransfer.findUniqueOrThrow({ where: { id: first.id } })).status).toBe('POSTED');
+  });
+
+  it('edits recurring transfer rules directly and deletes virtual occurrences without losing realized history', async () => {
+    const source = await finance.createAccount(ownerId, householdId, { name: `Editar regra ${suffix}`, type: 'CHECKING', initialBalance: 1_000 });
+    const destination = await finance.createAccount(ownerId, householdId, { name: `Editar regra destino ${suffix}`, type: 'INVESTMENT', initialBalance: 0 });
+    const dto = { sourceAccountId: source.id, destinationAccountId: destination.id, amount: 100, description: 'Regra original', startOn: '2029-01-31' };
+    const rule = await finance.createRecurringTransferRule(ownerId, householdId, dto);
+    const january = await finance.materializeRecurringTransferOccurrence(ownerId, householdId, rule.id, '2029-01-31');
+    const february = await finance.materializeRecurringTransferOccurrence(ownerId, householdId, rule.id, '2029-02-28');
+    await finance.setTransferStatus(ownerId, householdId, january.id, 'POSTED');
+    await expect(finance.updateRecurringTransferRule(outsiderId, householdId, rule.id, dto)).rejects.toBeInstanceOf(ForbiddenException);
+    const updated = await finance.updateRecurringTransferRule(ownerId, householdId, rule.id, { ...dto, amount: 250, description: 'Regra editada', endOn: '2029-05-31' });
+    expect(updated).toMatchObject({ predecessorId: rule.id, amount: 250, description: 'Regra editada' });
+    expect((await prisma.accountTransfer.findUniqueOrThrow({ where: { id: january.id } })).status).toBe('POSTED');
+    expect((await prisma.accountTransfer.findUniqueOrThrow({ where: { id: january.id } })).amount).toBe(100);
+    expect((await prisma.accountTransfer.findUniqueOrThrow({ where: { id: february.id } })).deletedAt).not.toBeNull();
+    let ledger = await finance.listTransfers(ownerId, householdId, { from: '2029-01-01', to: '2029-05-31' });
+    expect(ledger.filter((item) => item.recurringTransferRuleId === updated.id).map((item) => item.occurredOn.toISOString().slice(0, 10))).toEqual(['2029-05-31', '2029-04-30', '2029-03-31', '2029-02-28']);
+    await finance.deleteRecurringTransferRule(ownerId, householdId, updated.id, 'ONE', '2029-03-31');
+    await expect(finance.materializeRecurringTransferOccurrence(ownerId, householdId, updated.id, '2029-03-31')).rejects.toBeInstanceOf(BadRequestException);
+    ledger = await finance.listTransfers(ownerId, householdId, { from: '2029-01-01', to: '2029-05-31' });
+    expect(ledger.filter((item) => item.recurringTransferRuleId === updated.id)).toHaveLength(3);
+    await finance.deleteRecurringTransferRule(ownerId, householdId, updated.id, 'FOLLOWING', '2029-02-28');
+    ledger = await finance.listTransfers(ownerId, householdId, { from: '2029-01-01', to: '2029-05-31' });
+    expect(ledger.filter((item) => item.recurringTransferRuleId === updated.id)).toHaveLength(0);
+    await finance.deleteRecurringTransferRule(ownerId, householdId, updated.id);
+    expect((await prisma.accountTransfer.findUniqueOrThrow({ where: { id: january.id } })).status).toBe('POSTED');
+    expect(await prisma.auditLog.count({ where: { householdId, aggregateId: updated.id, action: 'schedule-updated' } })).toBe(1);
+  });
+
+  it('supports direct editing and removal of transfer rules before their first materialization', async () => {
+    const source = await finance.createAccount(ownerId, householdId, { name: `Regra virtual ${suffix}`, type: 'CHECKING', initialBalance: 0 });
+    const destination = await finance.createAccount(ownerId, householdId, { name: `Regra virtual destino ${suffix}`, type: 'SAVINGS', initialBalance: 0 });
+    const dto = { sourceAccountId: source.id, destinationAccountId: destination.id, amount: 100, startOn: '2030-01-10' };
+    const rule = await finance.createRecurringTransferRule(ownerId, householdId, dto);
+    const edited = await finance.updateRecurringTransferRule(ownerId, householdId, rule.id, { ...dto, startOn: '2030-01-15', amount: 200 });
+    const ledger = await finance.listTransfers(ownerId, householdId, { from: '2030-01-01', to: '2030-01-31' });
+    expect(ledger.find((item) => item.recurringTransferRuleId === edited.id)).toMatchObject({ amount: 200, isForecast: true });
+    await finance.deleteRecurringTransferRule(ownerId, householdId, edited.id);
+    expect((await finance.listTransfers(ownerId, householdId, { from: '2030-01-01', to: '2030-12-31' })).some((item) => item.recurringTransferRuleId === edited.id)).toBe(false);
   });
 });

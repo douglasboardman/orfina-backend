@@ -70,7 +70,7 @@ export class EventsService {
 
   private async assertCanManage(userId: string, householdId: string) {
     const membership = await this.prisma.householdMember.findUnique({ where: { householdId_userId: { householdId, userId } }, select: { role: true } });
-    if (!membership || (membership.role !== HouseholdRole.OWNER && membership.role !== HouseholdRole.ADMIN)) {
+    if (!membership || (membership.role !== HouseholdRole.OWNER && membership.role !== HouseholdRole.ADMIN && membership.role !== HouseholdRole.MANAGER)) {
       throw new ForbiddenException('Seu perfil não pode administrar a outbox deste grupo.');
     }
   }

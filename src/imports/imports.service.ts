@@ -181,7 +181,7 @@ export class ImportsService {
     const imported = await this.prisma.importItem.findFirst({ where: { householdId, fingerprint, status: ImportItemStatus.COMMITTED }, select: { id: true } });
     if (imported) return true;
     if (data.kind === 'TRANSFER') return Boolean(await this.prisma.accountTransfer.findFirst({ where: { householdId, sourceAccountId: data.sourceAccountId, destinationAccountId: data.destinationAccountId, amount: data.amount, occurredOn: this.civilDate(data.occurredOn) }, select: { id: true } }));
-    return Boolean(await this.prisma.transaction.findFirst({ where: { householdId, accountId: data.accountId, amount: data.amount, type: data.type as TransactionType, description: data.description, occurredOn: this.civilDate(data.occurredOn) }, select: { id: true } }));
+    return Boolean(await this.prisma.transaction.findFirst({ where: { householdId, deletedAt: null, accountId: data.accountId, amount: data.amount, type: data.type as TransactionType, description: data.description, occurredOn: this.civilDate(data.occurredOn) }, select: { id: true } }));
   }
 
   private resolveRow(row: ParsedRow, mapping: Mapping, defaultAccountId: string | undefined, accountByName: Map<string, string>) {

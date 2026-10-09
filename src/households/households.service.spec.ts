@@ -14,12 +14,21 @@ describe('HouseholdsService policies', () => {
     await expect(service.assertCanWrite('user_1', 'household_1')).rejects.toBeInstanceOf(ForbiddenException);
   });
 
-  it('permits OWNER and ADMIN to administer the household', async () => {
+  it('permits OWNER, ADMIN and MANAGER to administer finances and settings', async () => {
     member.findUnique.mockResolvedValueOnce({ role: HouseholdRole.OWNER });
     await expect(service.assertCanManage('user_1', 'household_1')).resolves.toEqual({ role: HouseholdRole.OWNER });
 
     member.findUnique.mockResolvedValueOnce({ role: HouseholdRole.ADMIN });
     await expect(service.assertCanManage('user_2', 'household_1')).resolves.toEqual({ role: HouseholdRole.ADMIN });
+
+    member.findUnique.mockResolvedValueOnce({ role: HouseholdRole.MANAGER });
+    await expect(service.assertCanManage('user_3', 'household_1')).resolves.toEqual({ role: HouseholdRole.MANAGER });
+  });
+
+  it('keeps member and invitation management restricted to OWNER and ADMIN', async () => {
+    member.findUnique.mockResolvedValue({ role: HouseholdRole.MANAGER });
+
+    await expect(service.assertCanManageUsers('user_1', 'household_1')).rejects.toBeInstanceOf(ForbiddenException);
   });
 
   it('blocks a regular MEMBER from administrative operations', async () => {

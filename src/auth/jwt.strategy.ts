@@ -5,7 +5,7 @@ import { ExtractJwt, Strategy } from 'passport-jwt';
 import { SystemRole } from '@prisma/client';
 import { cookieName, readCookie } from './auth-cookie';
 import { AuthService } from './auth.service';
-export type AuthenticatedUser = { id: string; email: string; name: string; sessionId: string; systemRole: SystemRole };
+export type AuthenticatedUser = { id: string; email: string; name: string; avatarUrl?: string | null; sessionId: string; systemRole: SystemRole };
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor(config: ConfigService, private readonly auth: AuthService) {
@@ -17,7 +17,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     if (typeof payload.sid !== 'string' || typeof payload.sub !== 'string') return null;
     const session = await this.auth.activeSession(payload.sid, payload.sub);
     if (!session) return null;
-    return { id: session.user.id, email: session.user.email, name: session.user.name,
+    return { id: session.user.id, email: session.user.email, name: session.user.name, avatarUrl: session.user.avatarUrl,
       systemRole: session.user.systemRole, sessionId: session.id };
   }
 }

@@ -1,5 +1,5 @@
 import { Body, Controller, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
-import { HouseholdRole, RecurringMaterializationMode } from '@prisma/client';
+import { FinancialRealizationMode, HouseholdRole, RecurringMaterializationMode } from '@prisma/client';
 import { z } from 'zod';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
@@ -13,14 +13,21 @@ const createHouseholdSchema = z.object({
 });
 const createInvitationSchema = z.object({
   email: z.string().trim().email().max(320),
-  role: z.enum([HouseholdRole.MEMBER, HouseholdRole.VIEWER]).default(HouseholdRole.MEMBER),
+  role: z.enum([HouseholdRole.MANAGER, HouseholdRole.MEMBER, HouseholdRole.VIEWER]).default(HouseholdRole.MEMBER),
+});
+const updateMemberSchema = z.object({
+  role: z.enum([HouseholdRole.MANAGER, HouseholdRole.MEMBER, HouseholdRole.VIEWER]),
+  displayName: z.string().trim().min(2).max(80).optional().or(z.literal('')),
+  isActive: z.boolean().default(true),
+  archive: z.boolean().default(false),
 });
 const householdSettingsSchema = z.object({
   name: z.string().trim().min(2).max(80).optional(),
   recurringMaterializationMode: z.nativeEnum(RecurringMaterializationMode).optional(),
   recurringMaterializationValue: z.number().int().min(0).max(28).optional(),
+  financialRealizationMode: z.nativeEnum(FinancialRealizationMode).optional(),
 }).superRefine((data, context) => {
-  if (!data.name && !data.recurringMaterializationMode && data.recurringMaterializationValue === undefined) context.addIssue({ code: z.ZodIssueCode.custom, message: 'Informe ao menos uma configuração para atualizar.' });
+  if (!data.name && !data.recurringMaterializationMode && !data.financialRealizationMode && data.recurringMaterializationValue === undefined) context.addIssue({ code: z.ZodIssueCode.custom, message: 'Informe ao menos uma configuração para atualizar.' });
   if (data.recurringMaterializationMode === RecurringMaterializationMode.EXERCISE_MONTH_DAY && (!data.recurringMaterializationValue || data.recurringMaterializationValue > 15)) context.addIssue({ code: z.ZodIssueCode.custom, path: ['recurringMaterializationValue'], message: 'Informe um dia entre 1 e 15.' });
   if (data.recurringMaterializationMode === RecurringMaterializationMode.DAYS_BEFORE_EXERCISE_MONTH && (!data.recurringMaterializationValue || data.recurringMaterializationValue > 28)) context.addIssue({ code: z.ZodIssueCode.custom, path: ['recurringMaterializationValue'], message: 'Informe entre 1 e 28 dias.' });
   if (data.recurringMaterializationMode === RecurringMaterializationMode.ON_OCCURRENCE_DATE && data.recurringMaterializationValue !== undefined && data.recurringMaterializationValue !== 0) context.addIssue({ code: z.ZodIssueCode.custom, path: ['recurringMaterializationValue'], message: 'O modo na data não usa valor adicional.' });
@@ -65,6 +72,11 @@ export class HouseholdsController {
   @Get(':householdId/invitations')
   listInvitations(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string) {
     return this.households.listInvitations(user.id, householdId);
+  }
+
+  @Patch(':householdId/members/:memberUserId')
+  updateMember(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('memberUserId') memberUserId: string, @Body() body: unknown) {
+    return this.households.updateMember(user.id, householdId, memberUserId, updateMemberSchema.parse(body));
   }
 
   @Post(':householdId/invitations')
