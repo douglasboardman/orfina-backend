@@ -336,6 +336,37 @@ export class FinanceService {
         ...(filters.to ? { lte: new Date(`${filters.to}T23:59:59.999Z`) } : {}),
       };
     }
+    // A month-bounded ledger includes virtual occurrences of active fixed rules.
+    // They remain read-only projections until the worker or the user materializes
+    // the occurrence, so a transaction is never duplicated merely for display.
+    if (filters.from && filters.to) {
+      const from = this.civilDate(filters.from);
+      const to = this.civilDate(filters.to);
+      const projectionEnd = new Date(to);
+      projectionEnd.setUTCDate(projectionEnd.getUTCDate() + 1);
+      const [persisted, recurringOccurrences, recurringRules] = await Promise.all([
+        this.prisma.transaction.findMany({
+          where, include: { account: true, card: true, subcategory: { include: { category: true } } },
+          orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }],
+        }),
+        this.prisma.transaction.findMany({
+          where: { householdId, recurringRuleId: { not: null }, recurrenceOn: { gte: from, lte: to } },
+          select: { recurringRuleId: true, recurrenceOn: true },
+        }),
+        this.prisma.recurringRule.findMany({
+          where: { householdId, status: RecurringRuleStatus.ACTIVE },
+          include: { account: true, card: true, category: true, subcategory: true },
+        }),
+      ]);
+      const existingRecurring = new Set(recurringOccurrences.map((item) => `${item.recurringRuleId}:${item.recurrenceOn?.toISOString().slice(0, 10)}`));
+      const projected = this.projectRecurringOccurrences(recurringRules as RecurringProjectionSource[], projectionEnd, existingRecurring)
+        .filter((item) => item.occurredOn >= from && item.occurredOn <= to)
+        .filter((item) => this.matchesProjectedTransaction(item, filters));
+      const all = [...persisted, ...projected].sort((a, b) => b.occurredOn.getTime() - a.occurredOn.getTime());
+      const start = (filters.page - 1) * filters.pageSize;
+      return { items: all.slice(start, start + filters.pageSize), total: all.length, page: filters.page, pageSize: filters.pageSize };
+    }
+
     const [items, total] = await this.prisma.$transaction([
       this.prisma.transaction.findMany({
         where, include: { account: true, card: true, subcategory: { include: { category: true } } },
@@ -750,6 +781,38 @@ export class FinanceService {
     });
   }
 
+  /** Materializes one projected fixed occurrence on explicit user confirmation. */
+  async materializeRecurringOccurrence(userId: string, householdId: string, ruleId: string, occurredOnInput: string) {
+    await this.households.assertCanWrite(userId, householdId);
+    const rule = await this.prisma.recurringRule.findFirst({ where: { id: ruleId, householdId }, include: { card: true } });
+    if (!rule || rule.status !== RecurringRuleStatus.ACTIVE) throw new NotFoundException('Recorrência ativa não encontrada neste grupo familiar.');
+    const occurredOn = this.civilDate(occurredOnInput);
+    if (!this.isRecurringOccurrence(rule.startOn, rule.endOn, occurredOn)) throw new BadRequestException('A data informada não corresponde a uma ocorrência desta recorrência.');
+
+    return this.prisma.$transaction(async (tx) => {
+      const existing = await tx.transaction.findUnique({
+        where: { recurringRuleId_recurrenceOn: { recurringRuleId: rule.id, recurrenceOn: occurredOn } },
+        include: { account: true, card: true, subcategory: { include: { category: true } } },
+      });
+      if (existing) return existing;
+      const statement = rule.card ? await this.statementForDate(tx, rule.card, householdId, occurredOn) : undefined;
+      if (statement && statement.status !== CardStatementStatus.OPEN) throw new BadRequestException('Não é possível gerar uma ocorrência em fatura fechada ou paga.');
+      const transaction = await tx.transaction.create({
+        data: {
+          householdId, accountId: rule.accountId, cardId: rule.cardId, statementId: statement?.id,
+          recurringRuleId: rule.id, recurrenceOn: occurredOn, subcategoryId: rule.subcategoryId,
+          type: rule.type, amount: rule.amount, description: rule.description, notes: rule.notes,
+          occurredOn, status: occurredOn <= this.civilDate(new Date()) ? TransactionStatus.POSTED : TransactionStatus.PENDING,
+        },
+        include: { account: true, card: true, subcategory: { include: { category: true } } },
+      });
+      if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
+      await this.events.record(tx, { aggregateType: 'recurring-occurrence', aggregateId: transaction.id, eventType: 'orfina.recurring.occurrence-created.v1', payload: { ruleId: rule.id, transactionId: transaction.id, householdId, occurredOn: occurredOn.toISOString(), materializedEarly: true } });
+      await this.audit(tx, householdId, userId, 'recurring-occurrence', transaction.id, 'materialized-early', ['recurringRuleId', 'occurredOn']);
+      return transaction;
+    });
+  }
+
   async setRecurringRuleStatus(userId: string, householdId: string, ruleId: string, status: 'ACTIVE' | 'PAUSED' | 'ENDED') {
     await this.households.assertCanWrite(userId, householdId);
     const rule = await this.prisma.recurringRule.findFirst({ where: { id: ruleId, householdId } });
@@ -791,15 +854,35 @@ export class FinanceService {
 
   /** Builds read-only future occurrences; persistence remains the worker's responsibility. */
   private projectRecurringOccurrences(rules: RecurringProjectionSource[], end: Date, existing: Set<string>) {
-    const projected: Array<{ id: string; accountId: string | null; cardId: string | null; account: unknown; card: unknown; subcategoryId: string; subcategory: { id: string; name: string; categoryId: string; isDefault: boolean; isActive: boolean; category: RecurringProjectionSource['category'] }; type: TransactionType; amount: number; description: string; notes: string | null; occurredOn: Date; status: TransactionStatus; isForecast: boolean }> = [];
+    const projected: Array<{ id: string; recurringRuleId: string; accountId: string | null; cardId: string | null; account: unknown; card: unknown; subcategoryId: string; subcategory: { id: string; name: string; categoryId: string; isDefault: boolean; isActive: boolean; category: RecurringProjectionSource['category'] }; type: TransactionType; amount: number; description: string; notes: string | null; occurredOn: Date; status: TransactionStatus; isForecast: boolean }> = [];
     for (const rule of rules) {
       for (let occurredOn = new Date(rule.startOn); occurredOn < end && (!rule.endOn || occurredOn <= rule.endOn); occurredOn = this.addMonths(occurredOn, 1)) {
         const key = `${rule.id}:${occurredOn.toISOString().slice(0, 10)}`;
         if (existing.has(key)) continue;
-        projected.push({ id: `forecast:${rule.id}:${occurredOn.toISOString().slice(0, 10)}`, accountId: rule.accountId, cardId: rule.cardId, account: rule.account, card: rule.card, subcategoryId: rule.subcategoryId, subcategory: { ...rule.subcategory, category: rule.category }, type: rule.type, amount: rule.amount, description: rule.description, notes: rule.notes, occurredOn, status: TransactionStatus.PENDING, isForecast: true });
+        projected.push({ id: `forecast:${rule.id}:${occurredOn.toISOString().slice(0, 10)}`, recurringRuleId: rule.id, accountId: rule.accountId, cardId: rule.cardId, account: rule.account, card: rule.card, subcategoryId: rule.subcategoryId, subcategory: { ...rule.subcategory, category: rule.category }, type: rule.type, amount: rule.amount, description: rule.description, notes: rule.notes, occurredOn, status: TransactionStatus.PENDING, isForecast: true });
       }
     }
     return projected;
+  }
+
+  private matchesProjectedTransaction(transaction: { accountId: string | null; cardId: string | null; recurringRuleId: string; subcategoryId: string; type: TransactionType; status: TransactionStatus; subcategory: { categoryId: string } }, filters: TransactionListFilters) {
+    if (filters.accountId && transaction.accountId !== filters.accountId) return false;
+    if (filters.cardId && transaction.cardId !== filters.cardId) return false;
+    if (filters.statementId || filters.importBatchId) return false;
+    if (filters.recurringRuleId && transaction.recurringRuleId !== filters.recurringRuleId) return false;
+    if (filters.categoryId && transaction.subcategory.categoryId !== filters.categoryId) return false;
+    if (filters.subcategoryId && transaction.subcategoryId !== filters.subcategoryId) return false;
+    if (filters.type && transaction.type !== filters.type) return false;
+    if (filters.status && transaction.status !== filters.status) return false;
+    return true;
+  }
+
+  private isRecurringOccurrence(startOnInput: Date, endOnInput: Date | null, occurredOn: Date) {
+    const startOn = this.civilDate(startOnInput);
+    const endOn = endOnInput ? this.civilDate(endOnInput) : undefined;
+    if (occurredOn < startOn || (endOn && occurredOn > endOn)) return false;
+    const months = (occurredOn.getUTCFullYear() - startOn.getUTCFullYear()) * 12 + occurredOn.getUTCMonth() - startOn.getUTCMonth();
+    return months >= 0 && this.addMonths(startOn, months).toISOString().slice(0, 10) === occurredOn.toISOString().slice(0, 10);
   }
 
   private async statementForDate(tx: Prisma.TransactionClient, card: { id: string; closingDay: number; dueDay: number }, householdId: string, occurredOn: string | Date) {

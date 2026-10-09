@@ -38,10 +38,11 @@ describe('FinanceService transaction rules', () => {
     await expect(service.convertTransaction('user_1', 'household_1', 'transaction_1', { mode: 'FIXED', ...dto, type: TransactionType.INCOME, startOn: dto.occurredOn })).rejects.toBeInstanceOf(BadRequestException);
   });
 
-  it('queries transactions with tenant scope, filters and pagination', async () => {
+  it('queries the month ledger with tenant scope, filters and pagination', async () => {
     households.assertMember.mockResolvedValue({ role: 'MEMBER' });
     prisma.transaction.findMany.mockReturnValue(Promise.resolve([]));
     prisma.transaction.count.mockReturnValue(Promise.resolve(0));
+    prisma.recurringRule.findMany.mockResolvedValue([]);
     prisma.$transaction.mockResolvedValue([[], 0]);
 
     const result = await service.listTransactions('user_1', 'household_1', {
@@ -50,8 +51,6 @@ describe('FinanceService transaction rules', () => {
 
     expect(result).toEqual({ items: [], total: 0, page: 2, pageSize: 20 });
     expect(prisma.transaction.findMany).toHaveBeenCalledWith(expect.objectContaining({
-      skip: 20,
-      take: 20,
       where: expect.objectContaining({ householdId: 'household_1', type: TransactionType.EXPENSE, accountId: 'cl333333333333333333333333' }),
     }));
   });

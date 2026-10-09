@@ -210,6 +210,29 @@ integration('Finance integration (PostgreSQL)', () => {
     expect(await prisma.transaction.findUnique({ where: { recurringRuleId_recurrenceOn: { recurringRuleId: rule.id, recurrenceOn: new Date('2026-11-08T12:00:00.000Z') } } })).toMatchObject({ status: 'POSTED' });
   });
 
+  it('projects a missing fixed occurrence in its month and materializes it idempotently before editing', async () => {
+    const account = await finance.createAccount(ownerId, householdId, { name: `Conta projeção ${suffix}`, type: 'CHECKING', initialBalance: 0 });
+    const expense = await finance.createCategory(ownerId, householdId, { name: `Fixas projetadas ${suffix}`, type: 'EXPENSE', color: '#5B5BD6', icon: 'receipt_long' });
+    const subcategory = await finance.createSubcategory(ownerId, householdId, expense.id, { name: 'Conta mensal' });
+    const rule = await finance.createRecurringRule(ownerId, householdId, { accountId: account.id, subcategoryId: subcategory.id, type: TransactionType.EXPENSE, amount: 45000, description: 'Luz projetada', startOn: '2026-10-09' });
+
+    const november = await finance.listTransactions(ownerId, householdId, { page: 1, pageSize: 20, from: '2026-11-01', to: '2026-11-30' });
+    const forecast = november.items.find((item) => item.recurringRuleId === rule.id);
+    expect(forecast).toEqual(expect.objectContaining({ isForecast: true, description: 'Luz projetada' }));
+    expect(forecast?.occurredOn.toISOString().slice(0, 10)).toBe('2026-11-09');
+    const novemberOverview = await finance.overview(ownerId, householdId, '2026-11');
+    expect(novemberOverview.recentTransactions).toEqual(expect.arrayContaining([expect.objectContaining({ recurringRuleId: rule.id, isForecast: true })]));
+    expect(novemberOverview.pendingCommitments).toBeGreaterThanOrEqual(45000);
+
+    const first = await finance.materializeRecurringOccurrence(ownerId, householdId, rule.id, '2026-11-09');
+    const retry = await finance.materializeRecurringOccurrence(ownerId, householdId, rule.id, '2026-11-09');
+    expect(retry.id).toBe(first.id);
+    expect(await prisma.transaction.count({ where: { householdId, recurringRuleId: rule.id, recurrenceOn: new Date('2026-11-09T12:00:00.000Z') } })).toBe(1);
+    const persisted = (await finance.listTransactions(ownerId, householdId, { page: 1, pageSize: 20, from: '2026-11-01', to: '2026-11-30' })).items.find((item) => item.id === first.id);
+    expect(persisted).toBeDefined();
+    expect('isForecast' in persisted!).toBe(false);
+  });
+
   it('converts only standalone transactions into recurring rules or installment purchases without duplication', async () => {
     const account = await finance.createAccount(ownerId, householdId, { name: `Conta conversão ${suffix}`, type: 'CHECKING', initialBalance: 0 });
     const category = await finance.createCategory(ownerId, householdId, { name: `Conversões ${suffix}`, type: 'EXPENSE', color: '#5B5BD6', icon: 'sync' });
