@@ -1,0 +1,30 @@
+# Used only on the workstation: glibc artifacts compatible with Ubuntu 24.04.
+FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY package*.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
+COPY prisma ./prisma
+RUN npx prisma generate
+COPY tsconfig*.json nest-cli.json ./
+COPY src ./src
+RUN npm run build
+
+FROM build AS artifact
+WORKDIR /production
+COPY package*.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --omit=optional --ignore-scripts --no-audit --no-fund
+COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=build /app/dist ./dist
+WORKDIR /migration
+COPY ops/migrations/package*.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
+COPY prisma ./prisma
+WORKDIR /supervisor
+COPY ops/native/package*.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --no-audit --no-fund
+RUN mkdir -p /artifact/backend /artifact/tools /artifact/runtime/bin /artifact/runtime/node_modules \
+ && cp -a /production/. /artifact/backend/ \
+ && cp -a /migration/. /artifact/tools/ \
+ && cp -p /usr/local/bin/node /artifact/runtime/bin/node \
+ && cp -a /supervisor/node_modules/. /artifact/runtime/node_modules/

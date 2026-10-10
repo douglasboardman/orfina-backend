@@ -1,0 +1,6 @@
+{
+  "name": "orfina-native-supervisor",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": { "pm2": "6.0.14" }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "orfina-migrations",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "prisma": "6.19.3" }
+}

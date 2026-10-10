@@ -3,6 +3,7 @@ import { AccountTransferStatus, AccountType, CardNetwork, CardStatementStatus, C
 import { EventsService } from '../events/events.service';
 import { HouseholdsService } from '../households/households.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { cardCycle, financialDate, financialPeriodWhere, inFinancialPeriod, statementForOccurrence, statementOutstandingAt } from './financial-period';
 
 type CreateAccount = { name: string; type: AccountType; bankName?: string; bankLogoUrl?: string; initialBalance: number };
 type UpdateAccount = Partial<CreateAccount>;
@@ -23,7 +24,7 @@ type StatementPayment = { accountId: string; amount: number; paidOn: string; ide
 type ArchivedItemType = 'ACCOUNT' | 'CARD' | 'CATEGORY' | 'SUBCATEGORY';
 type InstallmentPurchaseInput = { accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; totalAmount: number; installmentCount: number; startInstallmentNumber?: number; description: string; firstOccurredOn: string; notes?: string };
 type RecurringRuleInput = { accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; amount: number; description: string; notes?: string; startOn: string; endOn?: string };
-type RecurringProjectionSource = { id: string; householdId: string; accountId: string | null; cardId: string | null; subcategoryId: string; type: TransactionType; amount: number; description: string; notes: string | null; startOn: Date; endOn: Date | null; excludedOccurrences?: Prisma.JsonValue; account: unknown; card: unknown; category: { id: string; name: string; color: string; icon: string }; subcategory: { id: string; name: string; categoryId: string; isDefault: boolean; isActive: boolean } };
+type RecurringProjectionSource = { id: string; householdId: string; accountId: string | null; cardId: string | null; subcategoryId: string; type: TransactionType; amount: number; description: string; notes: string | null; startOn: Date; endOn: Date | null; excludedOccurrences?: Prisma.JsonValue; account: unknown; card: { closingDay: number; dueDay: number } | null; category: { id: string; name: string; color: string; icon: string }; subcategory: { id: string; name: string; categoryId: string; isDefault: boolean; isActive: boolean } };
 
 @Injectable()
 export class FinanceService {
@@ -56,22 +57,23 @@ export class FinanceService {
         },
         orderBy: { name: 'asc' },
       }),
-      this.prisma.transaction.findMany({ where: { householdId, deletedAt: null, occurredOn: { gte: start, lt: end } }, include: { subcategory: { include: { category: true } }, account: true, card: true }, orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }], take: 8 }),
-      this.prisma.transaction.findMany({ where: { householdId, deletedAt: null, occurredOn: { gte: start, lt: end } }, include: { account: true, card: true, subcategory: { include: { category: true } } }, orderBy: { occurredOn: 'asc' } }),
-      this.prisma.transaction.findMany({ where: { householdId, deletedAt: null, occurredOn: { gte: previousRange.start, lt: previousRange.end } }, select: { amount: true, type: true, status: true } }),
+      this.prisma.transaction.findMany({ where: { householdId, deletedAt: null, ...financialPeriodWhere(start, end) }, include: { subcategory: { include: { category: true } }, account: true, card: true, statement: true }, orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }] }),
+      this.prisma.transaction.findMany({ where: { householdId, deletedAt: null, ...financialPeriodWhere(start, end) }, include: { account: true, card: true, statement: true, subcategory: { include: { category: true } } }, orderBy: { occurredOn: 'asc' } }),
+      this.prisma.transaction.findMany({ where: { householdId, deletedAt: null, ...financialPeriodWhere(previousRange.start, previousRange.end) }, include: { card: true, statement: true } }),
       this.prisma.cardStatement.findMany({
-        where: isForecast
-          ? { householdId, status: { not: CardStatementStatus.PAID }, dueOn: { gte: start, lt: end } }
-          : { householdId, status: { not: CardStatementStatus.PAID } },
+        where: { householdId },
         include: { card: true, payments: true }, orderBy: { dueOn: 'asc' },
       }),
       this.prisma.recurringRule.findMany({ where: { householdId, status: RecurringRuleStatus.ACTIVE }, include: { account: true, card: true, category: true, subcategory: true } }),
       this.prisma.monthlyBudget.findMany({ where: { householdId, referenceMonth }, select: { categoryId: true, limitAmount: true } }),
-      this.prisma.transaction.findMany({ where: { householdId, recurringRuleId: { not: null }, occurredOn: { lt: end } }, select: { recurringRuleId: true, recurrenceOn: true } }),
+      this.prisma.transaction.findMany({ where: { householdId, recurringRuleId: { not: null }, recurrenceOn: { lt: end } }, select: { recurringRuleId: true, recurrenceOn: true } }),
     ]);
     const existingRecurring = new Set(recurringOccurrences.map((item) => `${item.recurringRuleId}:${item.recurrenceOn?.toISOString().slice(0, 10)}`));
-    const projectedRecurring = this.projectRecurringOccurrences(recurringRules as RecurringProjectionSource[], end, existingRecurring);
-    const projectedForMonth = projectedRecurring.filter((item) => item.occurredOn >= start && item.occurredOn < end);
+    const projectedRecurring = this.projectRecurringOccurrences(recurringRules as RecurringProjectionSource[], end, existingRecurring).flatMap((item) => {
+      const statement = statementForOccurrence(item, statements);
+      return statement && statement.status !== CardStatementStatus.OPEN ? [] : [{ ...item, statement }];
+    });
+    const projectedForMonth = projectedRecurring.filter((item) => inFinancialPeriod(item, start, end));
     const accountSummaries = accounts.map((account) => {
       const balanceAt = (cutoff: Date, includePending: boolean) => {
         const movement = account.transactions
@@ -87,6 +89,7 @@ export class FinanceService {
         return account.initialBalance + movement - payments - transfersOut + transfersIn;
       };
       const currentBalance = balanceAt(this.addDays(today, 1), false);
+      const previousMonthBalance = balanceAt(start, false);
       const realizedBalance = balanceAt(end, false);
       const projectedBalance = balanceAt(end, true) + projectedRecurring
         .filter((item) => item.accountId === account.id)
@@ -94,19 +97,31 @@ export class FinanceService {
       return {
         ...account,
         transactions: undefined, cardPayments: undefined, outgoingTransfers: undefined, incomingTransfers: undefined,
-        balance: currentBalance, realizedBalance, projectedBalance,
+        balance: currentBalance, previousMonthBalance, realizedBalance, projectedBalance,
       };
     });
-    const monthItems = [...monthTransactions, ...projectedForMonth].sort((a, b) => a.occurredOn.getTime() - b.occurredOn.getTime());
+    const monthItems = [...monthTransactions.filter((item) => inFinancialPeriod(item, start, end)), ...projectedForMonth].sort((a, b) => financialDate(a).getTime() - financialDate(b).getTime());
     const posted = monthItems.filter((transaction) => transaction.status === TransactionStatus.POSTED);
     const realizedIncome = this.sumByType(posted, TransactionType.INCOME);
     const realizedExpenses = this.sumByType(posted, TransactionType.EXPENSE);
     const pendingCommitments = this.sumByType(monthItems.filter((transaction) => transaction.status === TransactionStatus.PENDING), TransactionType.EXPENSE);
     const pendingIncome = this.sumByType(monthItems.filter((transaction) => transaction.status === TransactionStatus.PENDING), TransactionType.INCOME);
     const availableBalance = accountSummaries.filter((account) => account.type !== AccountType.INVESTMENT).reduce((sum, account) => sum + account.realizedBalance, 0);
-    const projectedAvailableBalance = accountSummaries.filter((account) => account.type !== AccountType.INVESTMENT).reduce((sum, account) => sum + account.projectedBalance, 0);
-    const investmentBalance = accountSummaries.filter((account) => account.type === AccountType.INVESTMENT).reduce((sum, account) => sum + account.balance, 0);
-    const previousPosted = previousTransactions.filter((transaction) => transaction.status === TransactionStatus.POSTED);
+    const previousMonthAvailableBalance = accountSummaries.filter((account) => account.type !== AccountType.INVESTMENT).reduce((sum, account) => sum + account.previousMonthBalance, 0);
+    const projectedDebtByCycle = new Map<string, number>();
+    const cycleKey = (cardId: string, cycleEnd: Date) => `${cardId}:${cycleEnd.toISOString().slice(0, 10)}`;
+    for (const statement of statements.filter((item) => this.civilDate(item.dueOn) < end)) {
+      projectedDebtByCycle.set(cycleKey(statement.cardId, statement.cycleEnd), statementOutstandingAt(statement, end));
+    }
+    for (const item of projectedRecurring.filter((entry) => entry.cardId && financialDate(entry) < end)) {
+      const cycleEnd = item.statement?.cycleEnd ?? cardCycle(item.card!, item.occurredOn).cycleEnd;
+      const key = cycleKey(item.cardId!, cycleEnd);
+      projectedDebtByCycle.set(key, (projectedDebtByCycle.get(key) ?? 0) + this.transactionImpact(item.type, item.amount));
+    }
+    const projectedCardDebt = [...projectedDebtByCycle.values()].reduce((sum, debt) => sum + Math.max(0, debt), 0);
+    const projectedAvailableBalance = accountSummaries.filter((account) => account.type !== AccountType.INVESTMENT).reduce((sum, account) => sum + account.projectedBalance, 0) - projectedCardDebt;
+    const investmentBalance = accountSummaries.filter((account) => account.type === AccountType.INVESTMENT).reduce((sum, account) => sum + account.realizedBalance, 0);
+    const previousPosted = previousTransactions.filter((transaction) => transaction.status === TransactionStatus.POSTED && inFinancialPeriod(transaction, previousRange.start, previousRange.end));
     const previousIncome = this.sumByType(previousPosted, TransactionType.INCOME);
     const previousExpenses = this.sumByType(previousPosted, TransactionType.EXPENSE);
     const weekly = Array.from({ length: 5 }, (_, index) => ({ week: index + 1, income: 0, expenses: 0 }));
@@ -114,7 +129,7 @@ export class FinanceService {
     const projectedWeekly = Array.from({ length: 5 }, (_, index) => ({ week: index + 1, income: 0, expenses: 0 }));
     const projectedCategoryTotals = new Map<string, { categoryId: string; name: string; color: string; amount: number }>();
     for (const transaction of posted) {
-      const week = Math.min(4, Math.floor((transaction.occurredOn.getUTCDate() - 1) / 7));
+      const week = Math.min(4, Math.floor((financialDate(transaction).getUTCDate() - 1) / 7));
       if (transaction.type === TransactionType.INCOME) weekly[week].income += transaction.amount;
       else {
         weekly[week].expenses += transaction.amount;
@@ -124,7 +139,7 @@ export class FinanceService {
       }
     }
     for (const transaction of monthItems.filter((item) => item.status !== TransactionStatus.DISCARDED)) {
-      const week = Math.min(4, Math.floor((transaction.occurredOn.getUTCDate() - 1) / 7));
+      const week = Math.min(4, Math.floor((financialDate(transaction).getUTCDate() - 1) / 7));
       if (transaction.type === TransactionType.INCOME) projectedWeekly[week].income += transaction.amount;
       else {
         projectedWeekly[week].expenses += transaction.amount;
@@ -135,7 +150,8 @@ export class FinanceService {
     }
     const budgetLimit = budgets.reduce((sum, budget) => sum + budget.limitAmount, 0);
     const budgetSpent = posted.filter((transaction) => transaction.type === TransactionType.EXPENSE && budgets.some((budget) => budget.categoryId === transaction.subcategory.categoryId)).reduce((sum, transaction) => sum + transaction.amount, 0);
-    const cardOpenTotal = statements.reduce((sum, statement) => sum + Math.max(0, statement.totalAmount - statement.payments.reduce((paid, payment) => paid + payment.amount, 0)), 0);
+    const upcomingStatements = statements.filter((statement) => this.civilDate(statement.dueOn) >= start && this.civilDate(statement.dueOn) < end && statementOutstandingAt(statement, end) > 0);
+    const cardOpenTotal = upcomingStatements.reduce((sum, statement) => sum + Math.max(0, statementOutstandingAt(statement, end)), 0);
     const netFlow = realizedIncome - realizedExpenses;
     const previousNetFlow = previousIncome - previousExpenses;
     return {
@@ -144,12 +160,12 @@ export class FinanceService {
       totalBalance: availableBalance,
       investmentBalance,
       accounts: accountSummaries,
-      recentTransactions: [...transactions, ...projectedForMonth].sort((a, b) => b.occurredOn.getTime() - a.occurredOn.getTime()).slice(0, 8),
+      recentTransactions: [...transactions.filter((item) => inFinancialPeriod(item, start, end)), ...projectedForMonth].sort((a, b) => financialDate(b).getTime() - financialDate(a).getTime()).slice(0, 8).map((item) => this.transactionMetadata(item)),
       cardOpenTotal,
       pendingCommitments,
-      upcomingStatements: statements,
+      upcomingStatements,
       recurringForecast: recurringRules.map((rule) => ({ id: rule.id, amount: rule.amount, description: rule.description, startOn: rule.startOn, endOn: rule.endOn })),
-      indicators: { availableBalance, projectedAvailableBalance, investmentBalance, realizedIncome, realizedExpenses, pendingIncome, pendingExpenses: pendingCommitments, totalIncome: realizedIncome + pendingIncome, totalExpenses: realizedExpenses + pendingCommitments, pendingCommitments, cardOpenTotal, budgetCommitted: budgetSpent + pendingCommitments },
+      indicators: { availableBalance, previousMonthAvailableBalance, projectedAvailableBalance, investmentBalance, realizedIncome, realizedExpenses, pendingIncome, pendingExpenses: pendingCommitments, totalIncome: realizedIncome + pendingIncome, totalExpenses: realizedExpenses + pendingCommitments, pendingCommitments, cardOpenTotal, budgetCommitted: budgetSpent + pendingCommitments },
       comparison: { income: { current: realizedIncome, previous: previousIncome }, expenses: { current: realizedExpenses, previous: previousExpenses }, balance: { current: netFlow, previous: previousNetFlow } },
       charts: {
         weeklyFlow: weekly,
@@ -467,12 +483,21 @@ export class FinanceService {
 
   async listTransactions(userId: string, householdId: string, filters: TransactionListFilters) {
     await this.households.assertMember(userId, householdId);
+    const statement = filters.statementId
+      ? await this.prisma.cardStatement.findFirst({
+        where: { id: filters.statementId, householdId },
+        select: { id: true, cardId: true, cycleStart: true, cycleEnd: true, dueOn: true, status: true },
+      })
+      : undefined;
+    if (filters.statementId && !statement) return { items: [], total: 0, page: filters.page, pageSize: filters.pageSize };
+    const rangeFrom = filters.from ? this.civilDate(filters.from) : statement?.cycleStart;
+    const rangeTo = filters.to ? this.civilDate(filters.to) : statement?.cycleEnd;
     const where: Prisma.TransactionWhereInput = {
       householdId,
       deletedAt: null,
       accountId: filters.accountId,
       cardId: filters.cardId,
-      statementId: filters.statementId,
+      statementId: statement ? undefined : filters.statementId,
       recurringRuleId: filters.recurringRuleId,
       subcategory: filters.categoryId ? { categoryId: filters.categoryId } : undefined,
       subcategoryId: filters.subcategoryId,
@@ -480,41 +505,66 @@ export class FinanceService {
       status: filters.status,
       importItem: filters.importBatchId ? { batchId: filters.importBatchId } : undefined,
     };
-    if (filters.from || filters.to) {
-      where.occurredOn = {
-        ...(filters.from ? { gte: new Date(`${filters.from}T00:00:00.000Z`) } : {}),
-        ...(filters.to ? { lte: new Date(`${filters.to}T23:59:59.999Z`) } : {}),
-      };
+    // The statement link is authoritative for newly created entries. The
+    // date-and-card fallback preserves the detail view for entries recorded
+    // before statements were introduced.
+    if (statement) {
+      where.OR = [
+        { statementId: statement.id },
+        { statementId: null, cardId: statement.cardId, occurredOn: { gte: statement.cycleStart, lte: statement.cycleEnd } },
+      ];
     }
-    // A month-bounded ledger includes virtual occurrences of active fixed rules.
+    if (filters.from || filters.to) {
+      if (statement) {
+        where.occurredOn = { ...(rangeFrom ? { gte: rangeFrom } : {}), ...(rangeTo ? { lte: rangeTo } : {}) };
+      } else {
+        where.AND = [financialPeriodWhere(rangeFrom, rangeTo ? this.addDays(rangeTo, 1) : undefined)];
+      }
+    }
+    // A bounded ledger includes virtual occurrences of active fixed rules.
     // They remain read-only projections until the worker or the user materializes
     // the occurrence, so a transaction is never duplicated merely for display.
-    if (filters.from && filters.to) {
-      const from = this.civilDate(filters.from);
-      const to = this.civilDate(filters.to);
+    if (rangeFrom && rangeTo) {
+      const from = rangeFrom;
+      const to = rangeTo;
       const projectionEnd = new Date(to);
       projectionEnd.setUTCDate(projectionEnd.getUTCDate() + 1);
-      const [persisted, recurringOccurrences, recurringRules] = await Promise.all([
+      const [persisted, recurringOccurrences, recurringRules, projectionStatements] = await Promise.all([
         this.prisma.transaction.findMany({
           where, include: { account: true, card: true, installmentPurchase: true, statement: true, subcategory: { include: { category: true } } },
           orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }],
         }),
         this.prisma.transaction.findMany({
-          where: { householdId, recurringRuleId: { not: null }, recurrenceOn: { gte: from, lte: to } },
+          where: { householdId, recurringRuleId: { not: null }, recurrenceOn: { lte: to } },
           select: { recurringRuleId: true, recurrenceOn: true },
         }),
         this.prisma.recurringRule.findMany({
           where: { householdId, status: RecurringRuleStatus.ACTIVE },
           include: { account: true, card: true, category: true, subcategory: true },
         }),
+        this.prisma.cardStatement.findMany({ where: { householdId } }),
       ]);
       const existingRecurring = new Set(recurringOccurrences.map((item) => `${item.recurringRuleId}:${item.recurrenceOn?.toISOString().slice(0, 10)}`));
-      const projected = this.projectRecurringOccurrences(recurringRules as RecurringProjectionSource[], projectionEnd, existingRecurring)
-        .filter((item) => item.occurredOn >= from && item.occurredOn <= to)
-        .filter((item) => this.matchesProjectedTransaction(item, filters));
-      const all = [...persisted, ...projected].sort((a, b) => b.occurredOn.getTime() - a.occurredOn.getTime());
+      const projectionFilters = statement ? { ...filters, statementId: undefined, cardId: statement.cardId } : filters;
+      const projected = statement?.status && statement.status !== CardStatementStatus.OPEN
+        ? []
+        : this.projectRecurringOccurrences(recurringRules as RecurringProjectionSource[], projectionEnd, existingRecurring)
+          .flatMap((item) => {
+            const target = statement ?? statementForOccurrence(item, projectionStatements);
+            return target && target.status !== CardStatementStatus.OPEN ? [] : [{ ...item, statement: target }];
+          })
+          .filter((item) => statement ? this.civilDate(item.occurredOn) >= from && this.civilDate(item.occurredOn) <= to : inFinancialPeriod(item, from, projectionEnd))
+          .filter((item) => this.matchesProjectedTransaction(item, projectionFilters));
+      const all = [...persisted.filter((item) => statement || inFinancialPeriod(item, from, projectionEnd)), ...projected].sort((a, b) => statement ? b.occurredOn.getTime() - a.occurredOn.getTime() : financialDate(b).getTime() - financialDate(a).getTime());
       const start = (filters.page - 1) * filters.pageSize;
       return { items: all.slice(start, start + filters.pageSize).map((item) => this.transactionMetadata(item)), total: all.length, page: filters.page, pageSize: filters.pageSize };
+    }
+
+    if (!statement && (rangeFrom || rangeTo)) {
+      const persisted = await this.prisma.transaction.findMany({ where, include: { account: true, card: true, installmentPurchase: true, statement: true, subcategory: { include: { category: true } } } });
+      const all = persisted.filter((item) => inFinancialPeriod(item, rangeFrom, rangeTo ? this.addDays(rangeTo, 1) : undefined)).sort((a, b) => financialDate(b).getTime() - financialDate(a).getTime());
+      const offset = (filters.page - 1) * filters.pageSize;
+      return { items: all.slice(offset, offset + filters.pageSize).map((item) => this.transactionMetadata(item)), total: all.length, page: filters.page, pageSize: filters.pageSize };
     }
 
     const [items, total] = await this.prisma.$transaction([
@@ -548,7 +598,7 @@ export class FinanceService {
       if (statement && statement.status !== CardStatementStatus.OPEN) throw new BadRequestException('Não é possível alterar uma fatura fechada ou paga. Registre um ajuste rastreável.');
       const transaction = await tx.transaction.create({
         data: { householdId, ...dto, status: dto.status ?? TransactionStatus.PENDING, statementId: statement?.id, occurredOn: this.civilDate(dto.occurredOn) },
-        include: { account: true, card: true, subcategory: { include: { category: true } } },
+        include: { account: true, card: true, statement: true, subcategory: { include: { category: true } } },
       });
       if (statement && transaction.status !== TransactionStatus.DISCARDED) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
       await this.events.record(tx, {
@@ -557,7 +607,7 @@ export class FinanceService {
         payload: { transactionId: transaction.id, householdId, accountId: transaction.accountId, cardId: transaction.cardId, categoryId: transaction.subcategory.categoryId, type: transaction.type, status: transaction.status },
       });
       await this.audit(tx, householdId, userId, 'transaction', transaction.id, 'created', ['accountId', 'cardId', 'subcategoryId', 'type', 'amount', 'occurredOn']);
-      return transaction;
+      return this.transactionMetadata(transaction);
     });
   }
 
@@ -596,7 +646,7 @@ export class FinanceService {
           statementId: statement?.id ?? null,
           occurredOn: this.civilDate(dto.occurredOn),
         },
-        include: { account: true, card: true, subcategory: { include: { category: true } } },
+        include: { account: true, card: true, statement: true, subcategory: { include: { category: true } } },
       });
       await this.events.record(tx, {
         aggregateType: 'transaction', aggregateId: transactionId,
@@ -606,7 +656,7 @@ export class FinanceService {
       if (current.statementId) await this.adjustStatementTotal(tx, current.statementId, -this.billableImpact(current));
       if (statement && transaction.status !== TransactionStatus.DISCARDED) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
       await this.audit(tx, householdId, userId, 'transaction', transactionId, 'updated', ['accountId', 'cardId', 'subcategoryId', 'type', 'amount', 'occurredOn']);
-      return transaction;
+      return this.transactionMetadata(transaction);
     });
   }
 
@@ -797,10 +847,10 @@ export class FinanceService {
         const nextImpact = status === TransactionStatus.DISCARDED ? 0 : this.transactionImpact(transaction.type, transaction.amount);
         if (previousImpact !== nextImpact) await this.adjustStatementTotal(tx, transaction.statementId, nextImpact - previousImpact);
       }
-      const updated = await tx.transaction.update({ where: { id: transactionId }, data: { status }, include: { account: true, card: true, subcategory: { include: { category: true } } } });
+      const updated = await tx.transaction.update({ where: { id: transactionId }, data: { status }, include: { account: true, card: true, statement: true, subcategory: { include: { category: true } } } });
       await this.events.record(tx, { aggregateType: 'transaction', aggregateId: transactionId, eventType: 'orfina.transactions.status-changed.v1', payload: { householdId, transactionId, status } });
       await this.audit(tx, householdId, userId, 'transaction', transactionId, 'status-changed', ['status']);
-      return updated;
+      return this.transactionMetadata(updated);
     });
   }
 
@@ -1056,7 +1106,7 @@ export class FinanceService {
     return this.prisma.cardStatement.findMany({
       where: { householdId, cardId },
       include: { payments: { orderBy: { paidOn: 'desc' } } },
-      orderBy: { cycleEnd: 'desc' },
+      orderBy: { dueOn: 'desc' },
     });
   }
 
@@ -1068,16 +1118,16 @@ export class FinanceService {
    */
   async listStatements(userId: string, householdId: string, referenceMonth?: string) {
     await this.households.assertMember(userId, householdId);
-    const cycleEnd = referenceMonth
+    const dueOn = referenceMonth
       ? (() => {
         const { start, end } = this.monthRange(this.monthStart(referenceMonth));
         return { gte: start, lt: end };
       })()
       : undefined;
     const statements = await this.prisma.cardStatement.findMany({
-      where: { householdId, card: { isActive: true }, cycleEnd },
+      where: { householdId, card: { isActive: true }, dueOn },
       include: { card: true, payments: { orderBy: { paidOn: 'desc' } } },
-      orderBy: [{ cycleEnd: 'desc' }, { dueOn: 'desc' }],
+      orderBy: [{ dueOn: 'desc' }, { cycleEnd: 'desc' }],
     });
     const outstanding = await this.prisma.cardStatement.findMany({
       where: { householdId, status: { not: CardStatementStatus.PAID }, card: { isActive: true } },
@@ -1236,9 +1286,9 @@ export class FinanceService {
     return this.prisma.$transaction(async (tx) => {
       const existing = await tx.transaction.findUnique({
         where: { recurringRuleId_recurrenceOn: { recurringRuleId: rule.id, recurrenceOn: occurredOn } },
-        include: { account: true, card: true, subcategory: { include: { category: true } } },
+        include: { account: true, card: true, statement: true, subcategory: { include: { category: true } } },
       });
-      if (existing) return existing;
+      if (existing) return this.transactionMetadata(existing);
       const statement = rule.card ? await this.statementForDate(tx, rule.card, householdId, occurredOn) : undefined;
       if (statement && statement.status !== CardStatementStatus.OPEN) throw new BadRequestException('Não é possível gerar uma ocorrência em fatura fechada ou paga.');
       const transaction = await tx.transaction.create({
@@ -1248,12 +1298,12 @@ export class FinanceService {
           type: rule.type, amount: rule.amount, description: rule.description, notes: rule.notes,
           occurredOn, status: TransactionStatus.PENDING,
         },
-        include: { account: true, card: true, subcategory: { include: { category: true } } },
+        include: { account: true, card: true, statement: true, subcategory: { include: { category: true } } },
       });
       if (statement) await this.adjustStatementTotal(tx, statement.id, this.transactionImpact(transaction.type, transaction.amount));
       await this.events.record(tx, { aggregateType: 'recurring-occurrence', aggregateId: transaction.id, eventType: 'orfina.recurring.occurrence-created.v1', payload: { ruleId: rule.id, transactionId: transaction.id, householdId, occurredOn: occurredOn.toISOString(), materializedEarly: true } });
       await this.audit(tx, householdId, userId, 'recurring-occurrence', transaction.id, 'materialized-early', ['recurringRuleId', 'occurredOn']);
-      return transaction;
+      return this.transactionMetadata(transaction);
     });
   }
 
@@ -1331,7 +1381,7 @@ export class FinanceService {
 
   /** Builds read-only future occurrences; persistence remains the worker's responsibility. */
   private projectRecurringOccurrences(rules: RecurringProjectionSource[], end: Date, existing: Set<string>) {
-    const projected: Array<{ id: string; recurringRuleId: string; accountId: string | null; cardId: string | null; account: unknown; card: unknown; subcategoryId: string; subcategory: { id: string; name: string; categoryId: string; isDefault: boolean; isActive: boolean; category: RecurringProjectionSource['category'] }; type: TransactionType; amount: number; description: string; notes: string | null; occurredOn: Date; status: TransactionStatus; isForecast: boolean }> = [];
+    const projected: Array<{ id: string; recurringRuleId: string; accountId: string | null; cardId: string | null; account: unknown; card: RecurringProjectionSource['card']; subcategoryId: string; subcategory: { id: string; name: string; categoryId: string; isDefault: boolean; isActive: boolean; category: RecurringProjectionSource['category'] }; type: TransactionType; amount: number; description: string; notes: string | null; occurredOn: Date; status: TransactionStatus; isForecast: boolean }> = [];
     for (const rule of rules) {
       for (const occurredOn of this.recurringDates(rule.startOn, rule.endOn, end)) {
         if (this.excludedDates(rule.excludedOccurrences).includes(occurredOn.toISOString().slice(0, 10))) continue;
@@ -1392,19 +1442,13 @@ export class FinanceService {
     return dates;
   }
 
-  private transactionMetadata<T extends { recurringRuleId?: string | null; installmentPurchaseId?: string | null; installmentNumber?: number | null; installmentPurchase?: { installmentCount: number; startInstallmentNumber: number } | null; statement?: { status: CardStatementStatus } | null; isForecast?: boolean }>(item: T) {
-    return { ...item, mode: item.installmentPurchaseId ? 'INSTALLMENT' : item.recurringRuleId ? 'FIXED' : 'SINGLE', installmentCount: item.installmentPurchase?.installmentCount ?? null, startInstallmentNumber: item.installmentPurchase?.startInstallmentNumber ?? null, statementStatus: item.statement?.status ?? null, isForecast: item.isForecast ?? false };
+  private transactionMetadata<T extends { occurredOn: Date; cardId?: string | null; card?: RecurringProjectionSource['card']; recurringRuleId?: string | null; installmentPurchaseId?: string | null; installmentNumber?: number | null; installmentPurchase?: { installmentCount: number; startInstallmentNumber: number } | null; statement?: { status: CardStatementStatus; dueOn: Date } | null; isForecast?: boolean }>(item: T) {
+    return { ...item, financialOn: financialDate(item), mode: item.installmentPurchaseId ? 'INSTALLMENT' : item.recurringRuleId ? 'FIXED' : 'SINGLE', installmentCount: item.installmentPurchase?.installmentCount ?? null, startInstallmentNumber: item.installmentPurchase?.startInstallmentNumber ?? null, statementStatus: item.statement?.status ?? null, isForecast: item.isForecast ?? false };
   }
 
   private async statementForDate(tx: Prisma.TransactionClient, card: { id: string; closingDay: number; dueDay: number }, householdId: string, occurredOn: string | Date) {
     await this.lockCard(tx, householdId, card.id);
-    const date = this.civilDate(occurredOn);
-    const year = date.getUTCFullYear();
-    const month = date.getUTCMonth();
-    const cycleEndMonth = date.getUTCDate() <= card.closingDay ? month : month + 1;
-    const cycleEnd = this.utcDate(year, cycleEndMonth, card.closingDay);
-    const cycleStart = this.utcDate(year, cycleEndMonth - 1, card.closingDay + 1);
-    const dueOn = this.utcDate(year, cycleEndMonth + (card.dueDay <= card.closingDay ? 1 : 0), card.dueDay);
+    const { cycleStart, cycleEnd, dueOn } = cardCycle(card, this.civilDate(occurredOn));
     return tx.cardStatement.upsert({ where: { cardId_cycleEnd: { cardId: card.id, cycleEnd } }, update: {}, create: { householdId, cardId: card.id, cycleStart, cycleEnd, dueOn } });
   }
 

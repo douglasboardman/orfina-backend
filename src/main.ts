@@ -32,6 +32,7 @@ async function bootstrap() {
     AppModule,
     new FastifyAdapter({ trustProxy: process.env.TRUST_PROXY ? process.env.TRUST_PROXY.split(',') : false }),
   );
+  app.enableShutdownHooks();
   app.setGlobalPrefix('api');
   app.enableCors({
     origin: allowedOrigins(),
@@ -42,7 +43,7 @@ async function bootstrap() {
   app.useGlobalFilters(new HttpErrorFilter());
   app.useGlobalGuards(app.get(CsrfGuard));
   app.getHttpAdapter().getInstance().addHook('onRequest', rateLimit);
-  await app.listen(Number(process.env.PORT ?? 3000), '0.0.0.0');
+  await app.listen(Number(process.env.PORT ?? 3000), process.env.HOST ?? '0.0.0.0');
 }
 
 void bootstrap();

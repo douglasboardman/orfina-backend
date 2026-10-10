@@ -3,6 +3,7 @@ import { Prisma, SavingsGoalStatus } from '@prisma/client';
 import { EventsService } from '../events/events.service';
 import { HouseholdsService } from '../households/households.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { financialDate, financialPeriodWhere, inFinancialPeriod, recurringFinancialOccurrences, statementOutstandingAt } from '../finance/financial-period';
 
 type BudgetInput = { categoryId: string; limitAmount: number; notes?: string };
 type GoalInput = { name: string; targetAmount: number; targetDate?: string; color: string; icon?: string };
@@ -16,28 +17,32 @@ export class PlanningService {
     await this.households.assertMember(userId, householdId);
     const referenceMonth = this.monthStart(month);
     const { start, end } = this.monthRange(referenceMonth);
-    const [budgets, categorySpend, categoryPending, categories, budgetMonth, recurringRules, installments, cards] = await Promise.all([
+    const [budgets, transactions, categories, budgetMonth, recurringRules, installments, cards, recurringOccurrences] = await Promise.all([
       this.prisma.monthlyBudget.findMany({ where: { householdId, referenceMonth, category: { isActive: true } }, include: { category: true }, orderBy: { category: { name: 'asc' } } }),
-      this.prisma.transaction.groupBy({ by: ['subcategoryId'], where: { householdId, type: 'EXPENSE', status: 'POSTED', occurredOn: { gte: start, lt: end } }, _sum: { amount: true } }),
-      this.prisma.transaction.groupBy({ by: ['subcategoryId'], where: { householdId, type: 'EXPENSE', status: 'PENDING', occurredOn: { gte: start, lt: end } }, _sum: { amount: true } }),
+      this.prisma.transaction.findMany({ where: { householdId, deletedAt: null, type: 'EXPENSE', status: { in: ['POSTED', 'PENDING'] }, ...financialPeriodWhere(start, end) }, include: { card: true, statement: true } }),
       this.prisma.category.findMany({ where: { householdId, type: 'EXPENSE', isActive: true }, orderBy: { name: 'asc' } }),
       this.prisma.budgetMonth.findUnique({ where: { householdId_referenceMonth: { householdId, referenceMonth } } }),
-      this.prisma.recurringRule.findMany({ where: { householdId, status: 'ACTIVE', startOn: { lt: end }, OR: [{ endOn: null }, { endOn: { gte: start } }] } }),
-      this.prisma.installmentPurchase.findMany({ where: { householdId, canceledAt: null }, include: { transactions: { where: { occurredOn: { gte: start, lt: end } } } } }),
-      this.prisma.cardStatement.findMany({ where: { householdId, status: { not: 'PAID' } }, include: { payments: true } }),
+      this.prisma.recurringRule.findMany({ where: { householdId, status: 'ACTIVE', type: 'EXPENSE', startOn: { lt: end } }, include: { card: true } }),
+      this.prisma.installmentPurchase.findMany({ where: { householdId, canceledAt: null, type: 'EXPENSE' }, include: { transactions: { where: { deletedAt: null, status: 'PENDING', ...financialPeriodWhere(start, end) }, include: { card: true, statement: true } } } }),
+      this.prisma.cardStatement.findMany({ where: { householdId }, include: { payments: true } }),
+      this.prisma.transaction.findMany({ where: { householdId, recurringRuleId: { not: null }, recurrenceOn: { lt: end } }, select: { recurringRuleId: true, recurrenceOn: true } }),
     ]);
     const subcategories = await this.prisma.subcategory.findMany({ where: { isActive: true, category: { householdId, isActive: true } }, select: { id: true, categoryId: true } });
     const parentBySubcategory = new Map(subcategories.map((item) => [item.id, item.categoryId]));
-    const aggregateByCategory = (items: { subcategoryId: string; _sum: { amount: number | null } }[]) => {
+    const existing = new Set(recurringOccurrences.map((item) => `${item.recurringRuleId}:${item.recurrenceOn?.toISOString().slice(0, 10)}`));
+    const recurringInMonth = recurringRules.flatMap((rule) => recurringFinancialOccurrences(rule, start, end, cards).map((occurredOn) => ({ rule, occurredOn })));
+    const forecasts = recurringInMonth.filter(({ rule, occurredOn }) => !existing.has(`${rule.id}:${occurredOn.toISOString().slice(0, 10)}`)).map(({ rule }) => ({ subcategoryId: rule.subcategoryId, amount: rule.amount }));
+    const monthTransactions = transactions.filter((item) => inFinancialPeriod(item, start, end));
+    const aggregateByCategory = (items: { subcategoryId: string; amount: number }[]) => {
       const totals = new Map<string, number>();
       for (const item of items) {
         const categoryId = parentBySubcategory.get(item.subcategoryId);
-        if (categoryId) totals.set(categoryId, (totals.get(categoryId) ?? 0) + (item._sum.amount ?? 0));
+        if (categoryId) totals.set(categoryId, (totals.get(categoryId) ?? 0) + item.amount);
       }
       return totals;
     };
-    const spendByCategory = aggregateByCategory(categorySpend);
-    const pendingByCategory = aggregateByCategory(categoryPending);
+    const spendByCategory = aggregateByCategory(monthTransactions.filter((item) => item.status === 'POSTED'));
+    const pendingByCategory = aggregateByCategory([...monthTransactions.filter((item) => item.status === 'PENDING'), ...forecasts]);
     const rows = budgets.map((budget) => ({
       ...budget,
       spentAmount: spendByCategory.get(budget.categoryId) ?? 0,
@@ -47,9 +52,9 @@ export class PlanningService {
     })).sort((a, b) => b.percentUsed - a.percentUsed || a.category.name.localeCompare(b.category.name));
     const budgeted = new Set(budgets.map((budget) => budget.categoryId));
     const unbudgeted = categories.filter((category) => !budgeted.has(category.id)).map((category) => ({ category, spentAmount: spendByCategory.get(category.id) ?? 0, pendingAmount: pendingByCategory.get(category.id) ?? 0 })).filter((item) => item.spentAmount > 0 || item.pendingAmount > 0);
-    const projectedRecurring = recurringRules.filter((rule) => this.ruleOccursInMonth(rule.startOn, referenceMonth)).reduce((sum, rule) => sum + rule.amount, 0);
-    const projectedInstallments = installments.reduce((sum, purchase) => sum + purchase.transactions.filter((transaction) => transaction.occurredOn >= this.today()).reduce((subtotal, transaction) => subtotal + transaction.amount, 0), 0);
-    const cardOpenTotal = cards.reduce((sum, statement) => sum + Math.max(0, statement.totalAmount - statement.payments.reduce((paid, payment) => paid + payment.amount, 0)), 0);
+    const projectedRecurring = recurringInMonth.reduce((sum, { rule }) => sum + rule.amount, 0);
+    const projectedInstallments = installments.reduce((sum, purchase) => sum + purchase.transactions.filter((transaction) => inFinancialPeriod(transaction, start, end) && financialDate(transaction) >= this.today()).reduce((subtotal, transaction) => subtotal + transaction.amount, 0), 0);
+    const cardOpenTotal = cards.filter((statement) => statement.dueOn.toISOString().slice(0, 7) === month).reduce((sum, statement) => sum + Math.max(0, statementOutstandingAt(statement, end)), 0);
     return {
       referenceMonth: referenceMonth.toISOString(),
       isClosed: Boolean(budgetMonth?.closedAt),
@@ -204,5 +209,4 @@ export class PlanningService {
   private monthRange(month: Date) { return { start: month, end: new Date(Date.UTC(month.getUTCFullYear(), month.getUTCMonth() + 1, 1, 12)) }; }
   private civilDate(value: string) { return new Date(`${value.slice(0, 10)}T12:00:00.000Z`); }
   private today() { return this.civilDate(new Date().toISOString()); }
-  private ruleOccursInMonth(startOn: Date, month: Date) { return startOn.getUTCDate() <= new Date(Date.UTC(month.getUTCFullYear(), month.getUTCMonth() + 1, 0)).getUTCDate(); }
 }
