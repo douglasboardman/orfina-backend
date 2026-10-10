@@ -120,6 +120,62 @@ describe('FinanceService transaction rules', () => {
     }));
   });
 
+  it.each(['00', '12'])('keeps civil balance boundaries when persisted dates return at %s:00 UTC', async (hour) => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-11-15T12:00:00.000Z'));
+    try {
+      const date = (day: string) => new Date(`${day}T${hour}:00:00.000Z`);
+      const ledger = [
+        { occurredOn: date('2026-10-31'), amount: 100, type: TransactionType.INCOME, status: 'POSTED' },
+        { occurredOn: date('2026-11-01'), amount: 200, type: TransactionType.INCOME, status: 'POSTED' },
+        { occurredOn: date('2026-11-16'), amount: 500, type: TransactionType.INCOME, status: 'POSTED' },
+        { occurredOn: date('2026-11-30'), amount: 300, type: TransactionType.EXPENSE, status: 'PENDING' },
+        { occurredOn: date('2026-12-01'), amount: 9000, type: TransactionType.INCOME, status: 'POSTED' },
+        { occurredOn: date('2026-12-01'), amount: 8000, type: TransactionType.EXPENSE, status: 'PENDING' },
+      ];
+      prisma.account.findMany.mockResolvedValue([{
+        id: 'account_1', type: 'CHECKING', initialBalance: 1000, transactions: ledger,
+        cardPayments: [{ paidOn: date('2026-11-01'), amount: 50 }, { paidOn: date('2026-12-01'), amount: 6000 }],
+        outgoingTransfers: [{ occurredOn: date('2026-11-01'), amount: 40, status: 'POSTED' }, { occurredOn: date('2026-12-01'), amount: 5000, status: 'PENDING' }],
+        incomingTransfers: [{ occurredOn: date('2026-11-01'), amount: 60, status: 'POSTED' }, { occurredOn: date('2026-12-01'), amount: 4000, status: 'POSTED' }],
+      }]);
+      prisma.transaction.findMany.mockResolvedValue([]);
+      prisma.recurringRule.findMany.mockResolvedValue([]);
+      prisma.monthlyBudget.findMany.mockResolvedValue([]);
+
+      const overview = await service.overview('user_1', 'household_1', '2026-11');
+
+      expect(overview.accounts[0]).toMatchObject({ balance: 1270, previousMonthBalance: 1100, realizedBalance: 1770, projectedBalance: 1470 });
+      expect(overview.indicators).toMatchObject({ previousMonthAvailableBalance: 1100, availableBalance: 1770, projectedAvailableBalance: 1470 });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('reserves card expenses once and excludes investment transfers from monthly income and expenses', async () => {
+    const occurredOn = new Date('2026-11-01T00:00:00.000Z');
+    const subcategory = { categoryId: 'category_1', category: { name: 'Categoria', color: '#123456' } };
+    const ledger = [
+      { occurredOn, amount: 1000, type: TransactionType.INCOME, status: 'PENDING', subcategory },
+      { occurredOn, amount: 200, type: TransactionType.EXPENSE, status: 'PENDING', subcategory },
+    ];
+    const transfer = { occurredOn, amount: 300, status: 'PENDING' };
+    prisma.account.findMany.mockResolvedValue([
+      { id: 'checking_1', type: 'CHECKING', initialBalance: 0, transactions: ledger, cardPayments: [], outgoingTransfers: [transfer], incomingTransfers: [] },
+      { id: 'investment_1', type: 'INVESTMENT', initialBalance: 500, transactions: [], cardPayments: [], outgoingTransfers: [], incomingTransfers: [transfer] },
+    ]);
+    const cardExpense = { occurredOn, cardId: 'card_1', statement: { dueOn: new Date('2026-11-05T00:00:00.000Z') }, amount: 100, type: TransactionType.EXPENSE, status: 'PENDING', subcategory };
+    prisma.transaction.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([...ledger, cardExpense]).mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    prisma.cardStatement.findMany.mockResolvedValue([{ cardId: 'card_1', cycleEnd: new Date('2026-11-02T00:00:00.000Z'), dueOn: new Date('2026-11-05T00:00:00.000Z'), totalAmount: 100, payments: [] }]);
+    prisma.recurringRule.findMany.mockResolvedValue([]);
+    prisma.monthlyBudget.findMany.mockResolvedValue([]);
+
+    const overview = await service.overview('user_1', 'household_1', '2026-11');
+
+    expect(overview.indicators).toMatchObject({ totalIncome: 1000, totalExpenses: 300, projectedAvailableBalance: 400, cardOpenTotal: 100 });
+    expect(overview.accounts.map((account) => account.projectedBalance)).toEqual([500, 800]);
+    expect(overview.indicators.projectedAvailableBalance).toBe(overview.indicators.totalIncome - overview.indicators.totalExpenses - transfer.amount);
+  });
+
   it('includes projected fixed card occurrences in an open future statement', async () => {
     households.assertMember.mockResolvedValue({ role: 'MEMBER' });
     prisma.cardStatement.findFirst.mockResolvedValue({

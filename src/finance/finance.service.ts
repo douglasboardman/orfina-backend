@@ -76,15 +76,17 @@ export class FinanceService {
     const projectedForMonth = projectedRecurring.filter((item) => inFinancialPeriod(item, start, end));
     const accountSummaries = accounts.map((account) => {
       const balanceAt = (cutoff: Date, includePending: boolean) => {
+        // PostgreSQL DATE values return at midnight; compare civil dates so
+        // the first day of the next period never leaks into this balance.
         const movement = account.transactions
-          .filter((item) => item.occurredOn < cutoff && (item.status === TransactionStatus.POSTED || (includePending && item.status === TransactionStatus.PENDING)))
+          .filter((item) => this.civilDate(item.occurredOn) < cutoff && (item.status === TransactionStatus.POSTED || (includePending && item.status === TransactionStatus.PENDING)))
           .reduce((sum, item) => sum + (item.type === 'INCOME' ? item.amount : -item.amount), 0);
-        const payments = account.cardPayments.filter((payment) => payment.paidOn < cutoff).reduce((sum, payment) => sum + payment.amount, 0);
+        const payments = account.cardPayments.filter((payment) => this.civilDate(payment.paidOn) < cutoff).reduce((sum, payment) => sum + payment.amount, 0);
         const transfersOut = account.outgoingTransfers
-          .filter((transfer) => transfer.occurredOn < cutoff && (transfer.status === AccountTransferStatus.POSTED || (includePending && transfer.status === AccountTransferStatus.PENDING)))
+          .filter((transfer) => this.civilDate(transfer.occurredOn) < cutoff && (transfer.status === AccountTransferStatus.POSTED || (includePending && transfer.status === AccountTransferStatus.PENDING)))
           .reduce((sum, transfer) => sum + transfer.amount, 0);
         const transfersIn = account.incomingTransfers
-          .filter((transfer) => transfer.occurredOn < cutoff && (transfer.status === AccountTransferStatus.POSTED || (includePending && transfer.status === AccountTransferStatus.PENDING)))
+          .filter((transfer) => this.civilDate(transfer.occurredOn) < cutoff && (transfer.status === AccountTransferStatus.POSTED || (includePending && transfer.status === AccountTransferStatus.PENDING)))
           .reduce((sum, transfer) => sum + transfer.amount, 0);
         return account.initialBalance + movement - payments - transfersOut + transfersIn;
       };
