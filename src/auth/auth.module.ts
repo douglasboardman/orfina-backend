@@ -6,11 +6,12 @@ import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { GoogleIdentityService } from './google.strategy';
 import { JwtStrategy } from './jwt.strategy';
-import { PrismaService } from '../prisma/prisma.service';
+import { PrismaModule } from '../prisma/prisma.module';
 import { CsrfGuard } from './csrf.guard';
 
 @Module({
   imports: [
+    PrismaModule,
     PassportModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],
@@ -22,7 +23,7 @@ import { CsrfGuard } from './csrf.guard';
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, GoogleIdentityService, JwtStrategy, CsrfGuard, PrismaService],
+  providers: [AuthService, GoogleIdentityService, JwtStrategy, CsrfGuard],
   exports: [AuthService, CsrfGuard],
 })
 export class AuthModule {}

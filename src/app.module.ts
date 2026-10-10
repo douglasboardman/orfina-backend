@@ -5,7 +5,7 @@ import { ConfigModule } from '@nestjs/config';
 import { AuthModule } from './auth/auth.module';
 import { HouseholdsModule } from './households/households.module';
 import { FinanceModule } from './finance/finance.module';
-import { PrismaService } from './prisma/prisma.service';
+import { PrismaModule } from './prisma/prisma.module';
 import { EventsModule } from './events/events.module';
 import { PlanningModule } from './planning/planning.module';
 import { ImportsModule } from './imports/imports.module';
@@ -15,6 +15,7 @@ import { HealthController } from './health.controller';
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true, validate: validateEnvironment }),
+    PrismaModule,
     AuthModule,
     IdentityModule,
     HouseholdsModule,
@@ -24,6 +25,5 @@ import { HealthController } from './health.controller';
     ImportsModule,
   ],
   controllers: [VersionController, HealthController],
-  providers: [PrismaService],
 })
 export class AppModule {}

@@ -49,3 +49,23 @@ A carga usa identificadores de origem e pode ser executada novamente sem duplica
 Defina `EVENTS_ENABLED=true` para ativar NATS. Os controles de retentativa usam `OUTBOX_POLL_INTERVAL_MS`, `OUTBOX_MAX_ATTEMPTS`, `OUTBOX_BACKOFF_BASE_MS` e `OUTBOX_BACKOFF_MAX_MS`.
 
 `GET /api/events/outbox/metrics` exige sessão e retorna a saúde da outbox.
+
+## Conexões e produção
+
+Todos os módulos importam `PrismaModule`, que fornece uma única instância de
+`PrismaService` por processo backend. Não registre esse provider novamente em
+módulos consumidores. Inicialização e encerramento conectam/desconectam o cliente
+uma vez; transações de domínio e outbox continuam usando o mesmo Prisma.
+
+O cliente acrescenta `connection_limit=5` e `pool_timeout=10` à `DATABASE_URL`
+quando ausentes. Configurações explícitas válidas são preservadas: o primeiro
+parâmetro limita conexões por processo e o segundo limita, em segundos, a espera
+na fila do pool. Considere todos os processos ao dimensionar conexões; a VPS
+atual executa uma única instância. A fila compartilha capacidade entre HTTP,
+relay e recorrências. Aumentos futuros exigem medir carga e memória.
+
+Produção usa Node/PM2, PostgreSQL, NATS e Caddy nativos. Artefatos glibc são
+construídos na estação e somente diferenças verificadas são transferidas para
+a VPS, sem build ou Docker no servidor. Antes do corte, o backup pg_dump age é
+copiado para a estação e conferido. Consulte o
+[runbook vigente](../deployment/NATIVE_RUNBOOK.md) para publicação e recuperação.
