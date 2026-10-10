@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
 import { FinancialRealizationMode, HouseholdRole, RecurringMaterializationMode } from '@prisma/client';
 import { z } from 'zod';
 import { CurrentUser } from '../auth/current-user.decorator';
@@ -69,6 +69,11 @@ export class HouseholdsController {
     return this.households.listMembers(user.id, householdId);
   }
 
+  @Get(':householdId/archived-members')
+  listArchivedMembers(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string) {
+    return this.households.listArchivedMembers(user.id, householdId);
+  }
+
   @Get(':householdId/invitations')
   listInvitations(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string) {
     return this.households.listInvitations(user.id, householdId);
@@ -77,6 +82,11 @@ export class HouseholdsController {
   @Patch(':householdId/members/:memberUserId')
   updateMember(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('memberUserId') memberUserId: string, @Body() body: unknown) {
     return this.households.updateMember(user.id, householdId, memberUserId, updateMemberSchema.parse(body));
+  }
+
+  @Delete(':householdId/members/:memberUserId')
+  deleteArchivedMember(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('memberUserId') memberUserId: string) {
+    return this.households.deleteArchivedMember(user.id, householdId, memberUserId);
   }
 
   @Post(':householdId/invitations')

@@ -13,6 +13,7 @@ const accountUpdateSchema = accountSchema.partial();
 const cardSchema = z.object({ name: z.string().trim().min(2).max(80), issuerName: z.string().trim().max(80).optional(), issuerLogoUrl: financialBrandLogoSchema.optional(), network: z.nativeEnum(CardNetwork), lastFour: z.string().regex(/^\d{4}$/).optional(), creditLimit: money.optional(), closingDay: z.number().int().min(1).max(28).default(1), dueDay: z.number().int().min(1).max(28).default(10) });
 const cardUpdateSchema = cardSchema.partial();
 const activeSchema = z.object({ isActive: z.boolean() });
+const archivedItemTypeSchema = z.enum(['ACCOUNT', 'CARD', 'CATEGORY', 'SUBCATEGORY']);
 const categorySchema = z.object({ name: z.string().trim().min(2).max(80), type: z.nativeEnum(CategoryType), color: z.string().regex(/^#[0-9A-Fa-f]{6}$/).default('#5B5BD6'), icon: z.string().trim().min(1).max(40).default('🏷️') });
 const categoryUpdateSchema = categorySchema.pick({ name: true, color: true, icon: true }).partial();
 const subcategorySchema = z.object({ name: z.string().trim().min(2).max(80) });
@@ -36,6 +37,7 @@ const transactionListSchema = z.object({
   importBatchId: z.string().cuid().optional(),
 });
 const overviewQuerySchema = z.object({ referenceMonth: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/).optional() });
+const statementListSchema = z.object({ referenceMonth: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/).optional() });
 const transferBaseSchema = z.object({ sourceAccountId: z.string().cuid(), destinationAccountId: z.string().cuid(), amount: money.positive(), description: z.string().trim().min(2).max(160).optional() });
 const transferSchema = transferBaseSchema.extend({ occurredOn: z.string().date(), status: z.nativeEnum(AccountTransferStatus).default(AccountTransferStatus.PENDING) }).refine((data) => data.sourceAccountId !== data.destinationAccountId, { message: 'Origem e destino devem ser diferentes.', path: ['destinationAccountId'] });
 const transferUpdateSchema = transferBaseSchema.extend({ occurredOn: z.string().date(), status: z.nativeEnum(AccountTransferStatus).optional() }).refine((data) => data.sourceAccountId !== data.destinationAccountId, { message: 'Origem e destino devem ser diferentes.', path: ['destinationAccountId'] });
@@ -64,6 +66,8 @@ export class FinanceController {
   @Get('overview') overview(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Query() query: unknown) {
     return this.finance.overview(user.id, householdId, overviewQuerySchema.parse(query).referenceMonth);
   }
+  @Get('archived-items') listArchivedItems(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string) { return this.finance.listArchivedItems(user.id, householdId); }
+  @Delete('archived-items/:type/:itemId') deleteArchivedItem(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('type') type: string, @Param('itemId') itemId: string) { return this.finance.deleteArchivedItem(user.id, householdId, archivedItemTypeSchema.parse(type), z.string().cuid().parse(itemId)); }
   @Get('accounts') listAccounts(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string) { return this.finance.listAccounts(user.id, householdId); }
   @Post('accounts') createAccount(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Body() body: unknown) { return this.finance.createAccount(user.id, householdId, accountSchema.parse(body)); }
   @Patch('accounts/:accountId') updateAccount(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('accountId') accountId: string, @Body() body: unknown) { return this.finance.updateAccount(user.id, householdId, accountId, accountUpdateSchema.parse(body)); }
@@ -73,6 +77,7 @@ export class FinanceController {
   @Patch('cards/:cardId') updateCard(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('cardId') cardId: string, @Body() body: unknown) { return this.finance.updateCard(user.id, householdId, cardId, cardUpdateSchema.parse(body)); }
   @Patch('cards/:cardId/status') setCardStatus(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('cardId') cardId: string, @Body() body: unknown) { return this.finance.setCardStatus(user.id, householdId, cardId, activeSchema.parse(body).isActive); }
   @Get('cards/:cardId/statements') listCardStatements(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('cardId') cardId: string) { return this.finance.listCardStatements(user.id, householdId, cardId); }
+  @Get('statements') listStatements(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Query() query: unknown) { return this.finance.listStatements(user.id, householdId, statementListSchema.parse(query).referenceMonth); }
   @Post('statements/:statementId/close') closeStatement(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('statementId') statementId: string) { return this.finance.closeStatement(user.id, householdId, statementId); }
   @Post('statements/:statementId/payments') payStatement(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Param('statementId') statementId: string, @Body() body: unknown) { return this.finance.payStatement(user.id, householdId, statementId, paymentSchema.parse(body)); }
   @Post('installment-purchases') createInstallmentPurchase(@CurrentUser() user: AuthenticatedUser, @Param('householdId') householdId: string, @Body() body: unknown) { return this.finance.createInstallmentPurchase(user.id, householdId, installmentSchema.parse(body)); }

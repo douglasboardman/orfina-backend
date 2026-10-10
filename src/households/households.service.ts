@@ -94,9 +94,18 @@ export class HouseholdsService {
   async listMembers(userId: string, householdId: string) {
     await this.assertCanManageUsers(userId, householdId);
     return this.prisma.householdMember.findMany({
-      where: { householdId },
+      where: { householdId, isActive: true, archivedAt: null },
       include: { user: { select: { id: true, name: true, email: true, avatarUrl: true } } },
       orderBy: [{ role: 'asc' }, { createdAt: 'asc' }],
+    });
+  }
+
+  async listArchivedMembers(userId: string, householdId: string) {
+    await this.assertCanManageUsers(userId, householdId);
+    return this.prisma.householdMember.findMany({
+      where: { householdId, OR: [{ isActive: false }, { archivedAt: { not: null } }] },
+      include: { user: { select: { id: true, name: true, email: true, avatarUrl: true } } },
+      orderBy: [{ archivedAt: 'desc' }, { createdAt: 'asc' }],
     });
   }
 
@@ -118,6 +127,19 @@ export class HouseholdsService {
       });
       await tx.auditLog.create({ data: { householdId, actorId, aggregateType: 'household-member', aggregateId: `${householdId}:${memberUserId}`, action: 'member-updated', changedFields: ['role', 'displayName', 'isActive', 'archivedAt'] } });
       return member;
+    });
+  }
+
+  async deleteArchivedMember(actorId: string, householdId: string, memberUserId: string) {
+    await this.assertCanManageUsers(actorId, householdId);
+    const member = await this.prisma.householdMember.findUnique({ where: { householdId_userId: { householdId, userId: memberUserId } } });
+    if (!member || (member.isActive && !member.archivedAt)) throw new NotFoundException('Membro arquivado não encontrado neste grupo familiar.');
+    if (member.role === HouseholdRole.OWNER || member.role === HouseholdRole.ADMIN) throw new BadRequestException('Membros com papel protegido não podem ser excluídos por esta operação.');
+    return this.prisma.$transaction(async (tx) => {
+      await tx.householdMember.delete({ where: { householdId_userId: { householdId, userId: memberUserId } } });
+      await this.events.record(tx, { aggregateType: 'household-member', aggregateId: `${householdId}:${memberUserId}`, eventType: 'orfina.households.member-deleted.v1', payload: { householdId, memberUserId, actorId } });
+      await tx.auditLog.create({ data: { householdId, actorId, aggregateType: 'household-member', aggregateId: `${householdId}:${memberUserId}`, action: 'deleted', changedFields: [] } });
+      return { householdId, userId: memberUserId, deleted: true };
     });
   }
 

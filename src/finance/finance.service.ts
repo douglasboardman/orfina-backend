@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { AccountTransferStatus, AccountType, CardNetwork, CardStatementStatus, CategoryType, FinancialRealizationMode, Prisma, RecurringMaterializationMode, RecurringRuleStatus, TransactionStatus, TransactionType } from '@prisma/client';
 import { EventsService } from '../events/events.service';
 import { HouseholdsService } from '../households/households.service';
@@ -20,6 +20,7 @@ type CreateTransfer = { sourceAccountId: string; destinationAccountId: string; a
 type RecurringTransferInput = Omit<CreateTransfer, 'occurredOn' | 'status'> & { startOn: string; endOn?: string };
 type DeleteScope = 'ONE' | 'FOLLOWING' | 'ALL';
 type StatementPayment = { accountId: string; amount: number; paidOn: string; idempotencyKey: string };
+type ArchivedItemType = 'ACCOUNT' | 'CARD' | 'CATEGORY' | 'SUBCATEGORY';
 type InstallmentPurchaseInput = { accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; totalAmount: number; installmentCount: number; startInstallmentNumber?: number; description: string; firstOccurredOn: string; notes?: string };
 type RecurringRuleInput = { accountId?: string; cardId?: string; subcategoryId: string; type: TransactionType; amount: number; description: string; notes?: string; startOn: string; endOn?: string };
 type RecurringProjectionSource = { id: string; householdId: string; accountId: string | null; cardId: string | null; subcategoryId: string; type: TransactionType; amount: number; description: string; notes: string | null; startOn: Date; endOn: Date | null; excludedOccurrences?: Prisma.JsonValue; account: unknown; card: unknown; category: { id: string; name: string; color: string; icon: string }; subcategory: { id: string; name: string; categoryId: string; isDefault: boolean; isActive: boolean } };
@@ -35,6 +36,9 @@ export class FinanceService {
   async overview(userId: string, householdId: string, requestedMonth?: string) {
     await this.households.assertMember(userId, householdId);
     const referenceMonth = this.monthStart(requestedMonth ?? new Date().toISOString().slice(0, 7));
+    const currentMonth = this.monthStart(new Date().toISOString().slice(0, 7));
+    const isForecast = referenceMonth > currentMonth;
+    const today = this.civilDate(new Date());
     const previousMonth = this.addMonths(referenceMonth, -1);
     const { start, end } = this.monthRange(referenceMonth);
     const previousRange = this.monthRange(previousMonth);
@@ -42,17 +46,25 @@ export class FinanceService {
       this.prisma.account.findMany({
         where: { householdId, isActive: true },
         include: {
-          transactions: { where: { status: TransactionStatus.POSTED, occurredOn: { lt: end } } },
-          cardPayments: { where: { paidOn: { lt: end } } },
-          outgoingTransfers: { where: { status: AccountTransferStatus.POSTED, occurredOn: { lt: end } } },
-          incomingTransfers: { where: { status: AccountTransferStatus.POSTED, occurredOn: { lt: end } } },
+          // The same account set serves the current balance and the selected
+          // month's projection. Keep both calculations in the API so the UI
+          // never has to infer a balance from partial ledger data.
+          transactions: { where: { deletedAt: null } },
+          cardPayments: true,
+          outgoingTransfers: { where: { deletedAt: null } },
+          incomingTransfers: { where: { deletedAt: null } },
         },
         orderBy: { name: 'asc' },
       }),
       this.prisma.transaction.findMany({ where: { householdId, deletedAt: null, occurredOn: { gte: start, lt: end } }, include: { subcategory: { include: { category: true } }, account: true, card: true }, orderBy: [{ occurredOn: 'desc' }, { createdAt: 'desc' }], take: 8 }),
       this.prisma.transaction.findMany({ where: { householdId, deletedAt: null, occurredOn: { gte: start, lt: end } }, include: { account: true, card: true, subcategory: { include: { category: true } } }, orderBy: { occurredOn: 'asc' } }),
       this.prisma.transaction.findMany({ where: { householdId, deletedAt: null, occurredOn: { gte: previousRange.start, lt: previousRange.end } }, select: { amount: true, type: true, status: true } }),
-      this.prisma.cardStatement.findMany({ where: { householdId, status: { not: CardStatementStatus.PAID } }, include: { card: true, payments: true }, orderBy: { dueOn: 'asc' }, take: 5 }),
+      this.prisma.cardStatement.findMany({
+        where: isForecast
+          ? { householdId, status: { not: CardStatementStatus.PAID }, dueOn: { gte: start, lt: end } }
+          : { householdId, status: { not: CardStatementStatus.PAID } },
+        include: { card: true, payments: true }, orderBy: { dueOn: 'asc' },
+      }),
       this.prisma.recurringRule.findMany({ where: { householdId, status: RecurringRuleStatus.ACTIVE }, include: { account: true, card: true, category: true, subcategory: true } }),
       this.prisma.monthlyBudget.findMany({ where: { householdId, referenceMonth }, select: { categoryId: true, limitAmount: true } }),
       this.prisma.transaction.findMany({ where: { householdId, recurringRuleId: { not: null }, occurredOn: { lt: end } }, select: { recurringRuleId: true, recurrenceOn: true } }),
@@ -61,11 +73,29 @@ export class FinanceService {
     const projectedRecurring = this.projectRecurringOccurrences(recurringRules as RecurringProjectionSource[], end, existingRecurring);
     const projectedForMonth = projectedRecurring.filter((item) => item.occurredOn >= start && item.occurredOn < end);
     const accountSummaries = accounts.map((account) => {
-      const movement = account.transactions.filter((item) => item.status === TransactionStatus.POSTED).reduce((sum, item) => sum + (item.type === 'INCOME' ? item.amount : -item.amount), 0);
-      const payments = account.cardPayments.reduce((sum, payment) => sum + payment.amount, 0);
-      const transfersOut = account.outgoingTransfers.filter((transfer) => transfer.status === AccountTransferStatus.POSTED).reduce((sum, transfer) => sum + transfer.amount, 0);
-      const transfersIn = account.incomingTransfers.filter((transfer) => transfer.status === AccountTransferStatus.POSTED).reduce((sum, transfer) => sum + transfer.amount, 0);
-      return { ...account, transactions: undefined, cardPayments: undefined, outgoingTransfers: undefined, incomingTransfers: undefined, balance: account.initialBalance + movement - payments - transfersOut + transfersIn };
+      const balanceAt = (cutoff: Date, includePending: boolean) => {
+        const movement = account.transactions
+          .filter((item) => item.occurredOn < cutoff && (item.status === TransactionStatus.POSTED || (includePending && item.status === TransactionStatus.PENDING)))
+          .reduce((sum, item) => sum + (item.type === 'INCOME' ? item.amount : -item.amount), 0);
+        const payments = account.cardPayments.filter((payment) => payment.paidOn < cutoff).reduce((sum, payment) => sum + payment.amount, 0);
+        const transfersOut = account.outgoingTransfers
+          .filter((transfer) => transfer.occurredOn < cutoff && (transfer.status === AccountTransferStatus.POSTED || (includePending && transfer.status === AccountTransferStatus.PENDING)))
+          .reduce((sum, transfer) => sum + transfer.amount, 0);
+        const transfersIn = account.incomingTransfers
+          .filter((transfer) => transfer.occurredOn < cutoff && (transfer.status === AccountTransferStatus.POSTED || (includePending && transfer.status === AccountTransferStatus.PENDING)))
+          .reduce((sum, transfer) => sum + transfer.amount, 0);
+        return account.initialBalance + movement - payments - transfersOut + transfersIn;
+      };
+      const currentBalance = balanceAt(this.addDays(today, 1), false);
+      const realizedBalance = balanceAt(end, false);
+      const projectedBalance = balanceAt(end, true) + projectedRecurring
+        .filter((item) => item.accountId === account.id)
+        .reduce((sum, item) => sum + (item.type === TransactionType.INCOME ? item.amount : -item.amount), 0);
+      return {
+        ...account,
+        transactions: undefined, cardPayments: undefined, outgoingTransfers: undefined, incomingTransfers: undefined,
+        balance: currentBalance, realizedBalance, projectedBalance,
+      };
     });
     const monthItems = [...monthTransactions, ...projectedForMonth].sort((a, b) => a.occurredOn.getTime() - b.occurredOn.getTime());
     const posted = monthItems.filter((transaction) => transaction.status === TransactionStatus.POSTED);
@@ -73,13 +103,16 @@ export class FinanceService {
     const realizedExpenses = this.sumByType(posted, TransactionType.EXPENSE);
     const pendingCommitments = this.sumByType(monthItems.filter((transaction) => transaction.status === TransactionStatus.PENDING), TransactionType.EXPENSE);
     const pendingIncome = this.sumByType(monthItems.filter((transaction) => transaction.status === TransactionStatus.PENDING), TransactionType.INCOME);
-    const availableBalance = accountSummaries.filter((account) => account.type !== AccountType.INVESTMENT).reduce((sum, account) => sum + account.balance, 0);
+    const availableBalance = accountSummaries.filter((account) => account.type !== AccountType.INVESTMENT).reduce((sum, account) => sum + account.realizedBalance, 0);
+    const projectedAvailableBalance = accountSummaries.filter((account) => account.type !== AccountType.INVESTMENT).reduce((sum, account) => sum + account.projectedBalance, 0);
     const investmentBalance = accountSummaries.filter((account) => account.type === AccountType.INVESTMENT).reduce((sum, account) => sum + account.balance, 0);
     const previousPosted = previousTransactions.filter((transaction) => transaction.status === TransactionStatus.POSTED);
     const previousIncome = this.sumByType(previousPosted, TransactionType.INCOME);
     const previousExpenses = this.sumByType(previousPosted, TransactionType.EXPENSE);
     const weekly = Array.from({ length: 5 }, (_, index) => ({ week: index + 1, income: 0, expenses: 0 }));
     const categoryTotals = new Map<string, { categoryId: string; name: string; color: string; amount: number }>();
+    const projectedWeekly = Array.from({ length: 5 }, (_, index) => ({ week: index + 1, income: 0, expenses: 0 }));
+    const projectedCategoryTotals = new Map<string, { categoryId: string; name: string; color: string; amount: number }>();
     for (const transaction of posted) {
       const week = Math.min(4, Math.floor((transaction.occurredOn.getUTCDate() - 1) / 7));
       if (transaction.type === TransactionType.INCOME) weekly[week].income += transaction.amount;
@@ -90,6 +123,16 @@ export class FinanceService {
         categoryTotals.set(transaction.subcategory.categoryId, category);
       }
     }
+    for (const transaction of monthItems.filter((item) => item.status !== TransactionStatus.DISCARDED)) {
+      const week = Math.min(4, Math.floor((transaction.occurredOn.getUTCDate() - 1) / 7));
+      if (transaction.type === TransactionType.INCOME) projectedWeekly[week].income += transaction.amount;
+      else {
+        projectedWeekly[week].expenses += transaction.amount;
+        const category = projectedCategoryTotals.get(transaction.subcategory.categoryId) ?? { categoryId: transaction.subcategory.categoryId, name: transaction.subcategory.category.name, color: transaction.subcategory.category.color, amount: 0 };
+        category.amount += transaction.amount;
+        projectedCategoryTotals.set(transaction.subcategory.categoryId, category);
+      }
+    }
     const budgetLimit = budgets.reduce((sum, budget) => sum + budget.limitAmount, 0);
     const budgetSpent = posted.filter((transaction) => transaction.type === TransactionType.EXPENSE && budgets.some((budget) => budget.categoryId === transaction.subcategory.categoryId)).reduce((sum, transaction) => sum + transaction.amount, 0);
     const cardOpenTotal = statements.reduce((sum, statement) => sum + Math.max(0, statement.totalAmount - statement.payments.reduce((paid, payment) => paid + payment.amount, 0)), 0);
@@ -97,7 +140,7 @@ export class FinanceService {
     const previousNetFlow = previousIncome - previousExpenses;
     return {
       referenceMonth: referenceMonth.toISOString().slice(0, 7),
-      isForecast: referenceMonth > this.monthStart(new Date().toISOString().slice(0, 7)),
+      isForecast,
       totalBalance: availableBalance,
       investmentBalance,
       accounts: accountSummaries,
@@ -106,19 +149,120 @@ export class FinanceService {
       pendingCommitments,
       upcomingStatements: statements,
       recurringForecast: recurringRules.map((rule) => ({ id: rule.id, amount: rule.amount, description: rule.description, startOn: rule.startOn, endOn: rule.endOn })),
-      indicators: { availableBalance, investmentBalance, realizedIncome, realizedExpenses, pendingIncome, pendingExpenses: pendingCommitments, totalIncome: realizedIncome + pendingIncome, totalExpenses: realizedExpenses + pendingCommitments, pendingCommitments, cardOpenTotal, budgetCommitted: budgetSpent + pendingCommitments },
+      indicators: { availableBalance, projectedAvailableBalance, investmentBalance, realizedIncome, realizedExpenses, pendingIncome, pendingExpenses: pendingCommitments, totalIncome: realizedIncome + pendingIncome, totalExpenses: realizedExpenses + pendingCommitments, pendingCommitments, cardOpenTotal, budgetCommitted: budgetSpent + pendingCommitments },
       comparison: { income: { current: realizedIncome, previous: previousIncome }, expenses: { current: realizedExpenses, previous: previousExpenses }, balance: { current: netFlow, previous: previousNetFlow } },
       charts: {
         weeklyFlow: weekly,
+        projectedWeeklyFlow: projectedWeekly,
         expenseByCategory: [...categoryTotals.values()].sort((a, b) => b.amount - a.amount),
+        projectedExpenseByCategory: [...projectedCategoryTotals.values()].sort((a, b) => b.amount - a.amount),
         budget: { limitAmount: budgetLimit, spentAmount: budgetSpent, pendingAmount: pendingCommitments },
       },
     };
   }
 
+  async listArchivedItems(userId: string, householdId: string) {
+    await this.households.assertCanManage(userId, householdId);
+    const [accounts, cards, categories, subcategories] = await Promise.all([
+      this.prisma.account.findMany({ where: { householdId, isActive: false }, orderBy: { name: 'asc' } }),
+      this.prisma.card.findMany({ where: { householdId, isActive: false }, orderBy: { name: 'asc' } }),
+      this.prisma.category.findMany({ where: { householdId, isActive: false }, orderBy: [{ type: 'asc' }, { name: 'asc' }] }),
+      this.prisma.subcategory.findMany({ where: { isActive: false, isDefault: false, category: { householdId } }, include: { category: { select: { id: true, name: true, type: true } } }, orderBy: { name: 'asc' } }),
+    ]);
+    return { accounts, cards, categories, subcategories };
+  }
+
+  async deleteArchivedItem(userId: string, householdId: string, type: ArchivedItemType, itemId: string) {
+    await this.households.assertCanManage(userId, householdId);
+    if (type === 'ACCOUNT') return this.deleteArchivedAccount(userId, householdId, itemId);
+    if (type === 'CARD') return this.deleteArchivedCard(userId, householdId, itemId);
+    if (type === 'CATEGORY') return this.deleteArchivedCategory(userId, householdId, itemId);
+    return this.deleteArchivedSubcategory(userId, householdId, itemId);
+  }
+
+  private async deleteArchivedAccount(userId: string, householdId: string, accountId: string) {
+    const account = await this.prisma.account.findFirst({ where: { id: accountId, householdId, isActive: false } });
+    if (!account) throw new NotFoundException('Conta arquivada não encontrada neste grupo familiar.');
+    const [transactions, transfers, payments, recurringRules, recurringTransfers, installments] = await Promise.all([
+      this.prisma.transaction.count({ where: { accountId } }),
+      this.prisma.accountTransfer.count({ where: { OR: [{ sourceAccountId: accountId }, { destinationAccountId: accountId }] } }),
+      this.prisma.cardPayment.count({ where: { accountId } }),
+      this.prisma.recurringRule.count({ where: { accountId } }),
+      this.prisma.recurringTransferRule.count({ where: { OR: [{ sourceAccountId: accountId }, { destinationAccountId: accountId }] } }),
+      this.prisma.installmentPurchase.count({ where: { accountId } }),
+    ]);
+    this.assertDeletionAllowed('a conta', { lançamentos: transactions, transferências: transfers, 'pagamentos de fatura': payments, recorrências: recurringRules, 'transferências recorrentes': recurringTransfers, parcelamentos: installments });
+    return this.prisma.$transaction(async (tx) => {
+      await tx.account.delete({ where: { id: accountId } });
+      await this.events.record(tx, { aggregateType: 'account', aggregateId: accountId, eventType: 'orfina.accounts.account-deleted.v1', payload: { accountId, householdId } });
+      await this.audit(tx, householdId, userId, 'account', accountId, 'deleted', []);
+      return { id: accountId, deleted: true };
+    });
+  }
+
+  private async deleteArchivedCard(userId: string, householdId: string, cardId: string) {
+    const card = await this.prisma.card.findFirst({ where: { id: cardId, householdId, isActive: false } });
+    if (!card) throw new NotFoundException('Cartão arquivado não encontrado neste grupo familiar.');
+    const [transactions, statements, installments, recurringRules] = await Promise.all([
+      this.prisma.transaction.count({ where: { cardId } }),
+      this.prisma.cardStatement.count({ where: { cardId } }),
+      this.prisma.installmentPurchase.count({ where: { cardId } }),
+      this.prisma.recurringRule.count({ where: { cardId } }),
+    ]);
+    this.assertDeletionAllowed('o cartão', { lançamentos: transactions, faturas: statements, parcelamentos: installments, recorrências: recurringRules });
+    return this.prisma.$transaction(async (tx) => {
+      await tx.card.delete({ where: { id: cardId } });
+      await this.events.record(tx, { aggregateType: 'card', aggregateId: cardId, eventType: 'orfina.cards.card-deleted.v1', payload: { cardId, householdId } });
+      await this.audit(tx, householdId, userId, 'card', cardId, 'deleted', []);
+      return { id: cardId, deleted: true };
+    });
+  }
+
+  private async deleteArchivedCategory(userId: string, householdId: string, categoryId: string) {
+    const category = await this.prisma.category.findFirst({ where: { id: categoryId, householdId, isActive: false } });
+    if (!category) throw new NotFoundException('Categoria arquivada não encontrada neste grupo familiar.');
+    const [transactions, installments, recurringRules, budgets] = await Promise.all([
+      this.prisma.transaction.count({ where: { subcategory: { categoryId } } }),
+      this.prisma.installmentPurchase.count({ where: { categoryId } }),
+      this.prisma.recurringRule.count({ where: { categoryId } }),
+      this.prisma.monthlyBudget.count({ where: { categoryId } }),
+    ]);
+    this.assertDeletionAllowed('a categoria', { lançamentos: transactions, parcelamentos: installments, recorrências: recurringRules, 'limites de orçamento': budgets });
+    return this.prisma.$transaction(async (tx) => {
+      await tx.category.delete({ where: { id: categoryId } });
+      await this.events.record(tx, { aggregateType: 'category', aggregateId: categoryId, eventType: 'orfina.categories.category-deleted.v1', payload: { categoryId, householdId } });
+      await this.audit(tx, householdId, userId, 'category', categoryId, 'deleted', []);
+      return { id: categoryId, deleted: true };
+    });
+  }
+
+  private async deleteArchivedSubcategory(userId: string, householdId: string, subcategoryId: string) {
+    const subcategory = await this.prisma.subcategory.findFirst({ where: { id: subcategoryId, isActive: false, isDefault: false, category: { householdId } } });
+    if (!subcategory) throw new NotFoundException('Subcategoria arquivada não encontrada neste grupo familiar.');
+    const [transactions, installments, recurringRules] = await Promise.all([
+      this.prisma.transaction.count({ where: { subcategoryId } }),
+      this.prisma.installmentPurchase.count({ where: { subcategoryId } }),
+      this.prisma.recurringRule.count({ where: { subcategoryId } }),
+    ]);
+    this.assertDeletionAllowed('a subcategoria', { lançamentos: transactions, parcelamentos: installments, recorrências: recurringRules });
+    return this.prisma.$transaction(async (tx) => {
+      await tx.subcategory.delete({ where: { id: subcategoryId } });
+      await this.events.record(tx, { aggregateType: 'subcategory', aggregateId: subcategoryId, eventType: 'orfina.categories.subcategory-deleted.v1', payload: { subcategoryId, categoryId: subcategory.categoryId, householdId } });
+      await this.audit(tx, householdId, userId, 'subcategory', subcategoryId, 'deleted', []);
+      return { id: subcategoryId, deleted: true };
+    });
+  }
+
+  private assertDeletionAllowed(label: string, relations: Record<string, number>) {
+    const impacts = Object.entries(relations).filter(([, count]) => count > 0);
+    if (!impacts.length) return;
+    const details = impacts.map(([name, count]) => `${count} ${name}`).join(', ');
+    throw new ConflictException(`Não é possível excluir ${label} porque existem registros relacionados: ${details}. Reative-o ou mantenha-o arquivado para preservar o histórico.`);
+  }
+
   async listAccounts(userId: string, householdId: string) {
     await this.households.assertMember(userId, householdId);
-    const accounts = await this.prisma.account.findMany({ where: { householdId }, include: { transactions: true, cardPayments: true, outgoingTransfers: true, incomingTransfers: true }, orderBy: { name: 'asc' } });
+    const accounts = await this.prisma.account.findMany({ where: { householdId, isActive: true }, include: { transactions: true, cardPayments: true, outgoingTransfers: true, incomingTransfers: true }, orderBy: { name: 'asc' } });
     return accounts.map((account) => {
       const movement = account.transactions.filter((item) => item.status === TransactionStatus.POSTED).reduce((sum, item) => sum + (item.type === 'INCOME' ? item.amount : -item.amount), 0);
       const payments = account.cardPayments.reduce((sum, payment) => sum + payment.amount, 0);
@@ -176,7 +320,7 @@ export class FinanceService {
 
   async listCards(userId: string, householdId: string) {
     await this.households.assertMember(userId, householdId);
-    return this.prisma.card.findMany({ where: { householdId }, orderBy: { name: 'asc' } });
+    return this.prisma.card.findMany({ where: { householdId, isActive: true }, orderBy: { name: 'asc' } });
   }
 
   async createCard(userId: string, householdId: string, dto: CreateCard) {
@@ -216,8 +360,8 @@ export class FinanceService {
   async listCategories(userId: string, householdId: string) {
     await this.households.assertMember(userId, householdId);
     return this.prisma.category.findMany({
-      where: { householdId },
-      include: { subcategories: { orderBy: { name: 'asc' } } },
+      where: { householdId, isActive: true },
+      include: { subcategories: { where: { isActive: true }, orderBy: { name: 'asc' } } },
       orderBy: [{ type: 'asc' }, { name: 'asc' }],
     });
   }
@@ -913,6 +1057,45 @@ export class FinanceService {
       where: { householdId, cardId },
       include: { payments: { orderBy: { paidOn: 'desc' } } },
       orderBy: { cycleEnd: 'desc' },
+    });
+  }
+
+  /**
+   * Lists the invoices that are still visible to the household.  Limit usage is
+   * calculated from every unpaid invoice of the same card, rather than just the
+   * displayed cycle, so the value is useful when a prior statement is partially
+   * paid.
+   */
+  async listStatements(userId: string, householdId: string, referenceMonth?: string) {
+    await this.households.assertMember(userId, householdId);
+    const cycleEnd = referenceMonth
+      ? (() => {
+        const { start, end } = this.monthRange(this.monthStart(referenceMonth));
+        return { gte: start, lt: end };
+      })()
+      : undefined;
+    const statements = await this.prisma.cardStatement.findMany({
+      where: { householdId, card: { isActive: true }, cycleEnd },
+      include: { card: true, payments: { orderBy: { paidOn: 'desc' } } },
+      orderBy: [{ cycleEnd: 'desc' }, { dueOn: 'desc' }],
+    });
+    const outstanding = await this.prisma.cardStatement.findMany({
+      where: { householdId, status: { not: CardStatementStatus.PAID }, card: { isActive: true } },
+      include: { payments: true },
+    });
+    const usedByCard = new Map<string, number>();
+    for (const statement of outstanding) {
+      const paid = statement.payments.reduce((sum, payment) => sum + payment.amount, 0);
+      usedByCard.set(statement.cardId, (usedByCard.get(statement.cardId) ?? 0) + Math.max(0, statement.totalAmount - paid));
+    }
+    return statements.map((statement) => {
+      const limitUsedAmount = usedByCard.get(statement.cardId) ?? 0;
+      const creditLimit = statement.card.creditLimit ?? null;
+      return {
+        ...statement,
+        limitUsedAmount,
+        limitUsagePercent: creditLimit && creditLimit > 0 ? Math.min(100, Math.round((limitUsedAmount / creditLimit) * 100)) : null,
+      };
     });
   }
 

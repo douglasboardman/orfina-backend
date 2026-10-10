@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma, SavingsGoalStatus } from '@prisma/client';
 import { EventsService } from '../events/events.service';
 import { HouseholdsService } from '../households/households.service';
@@ -17,16 +17,16 @@ export class PlanningService {
     const referenceMonth = this.monthStart(month);
     const { start, end } = this.monthRange(referenceMonth);
     const [budgets, categorySpend, categoryPending, categories, budgetMonth, recurringRules, installments, cards] = await Promise.all([
-      this.prisma.monthlyBudget.findMany({ where: { householdId, referenceMonth }, include: { category: true }, orderBy: { category: { name: 'asc' } } }),
+      this.prisma.monthlyBudget.findMany({ where: { householdId, referenceMonth, category: { isActive: true } }, include: { category: true }, orderBy: { category: { name: 'asc' } } }),
       this.prisma.transaction.groupBy({ by: ['subcategoryId'], where: { householdId, type: 'EXPENSE', status: 'POSTED', occurredOn: { gte: start, lt: end } }, _sum: { amount: true } }),
       this.prisma.transaction.groupBy({ by: ['subcategoryId'], where: { householdId, type: 'EXPENSE', status: 'PENDING', occurredOn: { gte: start, lt: end } }, _sum: { amount: true } }),
-      this.prisma.category.findMany({ where: { householdId, type: 'EXPENSE' }, orderBy: { name: 'asc' } }),
+      this.prisma.category.findMany({ where: { householdId, type: 'EXPENSE', isActive: true }, orderBy: { name: 'asc' } }),
       this.prisma.budgetMonth.findUnique({ where: { householdId_referenceMonth: { householdId, referenceMonth } } }),
       this.prisma.recurringRule.findMany({ where: { householdId, status: 'ACTIVE', startOn: { lt: end }, OR: [{ endOn: null }, { endOn: { gte: start } }] } }),
       this.prisma.installmentPurchase.findMany({ where: { householdId, canceledAt: null }, include: { transactions: { where: { occurredOn: { gte: start, lt: end } } } } }),
       this.prisma.cardStatement.findMany({ where: { householdId, status: { not: 'PAID' } }, include: { payments: true } }),
     ]);
-    const subcategories = await this.prisma.subcategory.findMany({ where: { category: { householdId } }, select: { id: true, categoryId: true } });
+    const subcategories = await this.prisma.subcategory.findMany({ where: { isActive: true, category: { householdId, isActive: true } }, select: { id: true, categoryId: true } });
     const parentBySubcategory = new Map(subcategories.map((item) => [item.id, item.categoryId]));
     const aggregateByCategory = (items: { subcategoryId: string; _sum: { amount: number | null } }[]) => {
       const totals = new Map<string, number>();
@@ -73,7 +73,7 @@ export class PlanningService {
     await this.households.assertCanManage(userId, householdId);
     const referenceMonth = this.monthStart(month);
     await this.assertBudgetOpen(householdId, referenceMonth);
-    const category = await this.prisma.category.findFirst({ where: { id: input.categoryId, householdId, type: 'EXPENSE' } });
+    const category = await this.prisma.category.findFirst({ where: { id: input.categoryId, householdId, type: 'EXPENSE', isActive: true } });
     if (!category) throw new NotFoundException('Categoria de despesa não encontrada neste grupo familiar.');
     return this.prisma.$transaction(async (tx) => {
       const budget = await tx.monthlyBudget.upsert({ where: { householdId_referenceMonth_categoryId: { householdId, referenceMonth, categoryId: category.id } }, update: { limitAmount: input.limitAmount, notes: input.notes }, create: { householdId, referenceMonth, categoryId: category.id, limitAmount: input.limitAmount, notes: input.notes } });
@@ -125,8 +125,28 @@ export class PlanningService {
 
   async listGoals(userId: string, householdId: string) {
     await this.households.assertMember(userId, householdId);
-    const goals = await this.prisma.savingsGoal.findMany({ where: { householdId }, include: { contributions: { orderBy: { occurredOn: 'desc' } } }, orderBy: { createdAt: 'desc' } });
+    const goals = await this.prisma.savingsGoal.findMany({ where: { householdId, status: { not: SavingsGoalStatus.ARCHIVED } }, include: { contributions: { orderBy: { occurredOn: 'desc' } } }, orderBy: { createdAt: 'desc' } });
     return goals.map((goal) => this.goalProjection(goal));
+  }
+
+  async listArchivedGoals(userId: string, householdId: string) {
+    await this.households.assertCanManage(userId, householdId);
+    const goals = await this.prisma.savingsGoal.findMany({ where: { householdId, status: SavingsGoalStatus.ARCHIVED }, include: { contributions: { orderBy: { occurredOn: 'desc' } } }, orderBy: { createdAt: 'desc' } });
+    return goals.map((goal) => this.goalProjection(goal));
+  }
+
+  async deleteArchivedGoal(userId: string, householdId: string, goalId: string) {
+    await this.households.assertCanManage(userId, householdId);
+    const goal = await this.prisma.savingsGoal.findFirst({ where: { id: goalId, householdId, status: SavingsGoalStatus.ARCHIVED } });
+    if (!goal) throw new NotFoundException('Meta arquivada não encontrada neste grupo familiar.');
+    const contributions = await this.prisma.goalContribution.count({ where: { goalId } });
+    if (contributions) throw new ConflictException(`Não é possível excluir a meta porque existem ${contributions} contribuições relacionadas. Reative-a ou mantenha-a arquivada para preservar o histórico.`);
+    return this.prisma.$transaction(async (tx) => {
+      await tx.savingsGoal.delete({ where: { id: goalId } });
+      await this.events.record(tx, { aggregateType: 'savings-goal', aggregateId: goalId, eventType: 'orfina.goals.goal-deleted.v1', payload: { householdId, goalId } });
+      await this.audit(tx, householdId, userId, 'savings-goal', goalId, 'deleted', []);
+      return { id: goalId, deleted: true };
+    });
   }
 
   async createGoal(userId: string, householdId: string, input: GoalInput) {

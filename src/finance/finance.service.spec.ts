@@ -1,14 +1,16 @@
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, ConflictException } from '@nestjs/common';
 import { RecurringMaterializationMode, TransactionType } from '@prisma/client';
 import { FinanceService } from './finance.service';
 
 describe('FinanceService transaction rules', () => {
   const prisma = {
     account: { findFirst: jest.fn(), findMany: jest.fn() },
+    card: { findFirst: jest.fn(), findMany: jest.fn() },
     subcategory: { findFirst: jest.fn() },
     transaction: { findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn() },
-    cardStatement: { findMany: jest.fn() },
-    recurringRule: { findMany: jest.fn() },
+    cardStatement: { findMany: jest.fn(), count: jest.fn() },
+    recurringRule: { findMany: jest.fn(), count: jest.fn() },
+    installmentPurchase: { count: jest.fn() },
     monthlyBudget: { findMany: jest.fn() },
     $transaction: jest.fn(),
   };
@@ -24,6 +26,17 @@ describe('FinanceService transaction rules', () => {
     prisma.subcategory.findFirst.mockResolvedValue({ id: dto.subcategoryId, categoryId: 'cat_1', category: { type: TransactionType.INCOME } });
 
     await expect(service.createTransaction('user_1', 'household_1', dto)).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('keeps an archived card when it has a financial record linked to it', async () => {
+    households.assertCanManage.mockResolvedValue({ role: 'MANAGER' });
+    prisma.card.findFirst.mockResolvedValue({ id: 'card_1', householdId: 'household_1', isActive: false });
+    prisma.transaction.count.mockResolvedValue(1);
+    prisma.cardStatement.count.mockResolvedValue(0);
+    prisma.installmentPurchase.count.mockResolvedValue(0);
+    prisma.recurringRule.count.mockResolvedValue(0);
+
+    await expect(service.deleteArchivedItem('user_1', 'household_1', 'CARD', 'card_1')).rejects.toBeInstanceOf(ConflictException);
   });
 
   it('only converts a standalone transaction and preserves its financial type', async () => {
@@ -68,6 +81,7 @@ describe('FinanceService transaction rules', () => {
         transactions: [
           { occurredOn: new Date('2026-03-10T12:00:00.000Z'), amount: 50, type: TransactionType.EXPENSE, status: 'POSTED' },
           { occurredOn: new Date('2026-04-04T12:00:00.000Z'), amount: 250, type: TransactionType.INCOME, status: 'POSTED' },
+          { occurredOn: new Date('2026-04-09T12:00:00.000Z'), amount: 100, type: TransactionType.EXPENSE, status: 'PENDING' },
         ],
         cardPayments: [{ paidOn: new Date('2026-04-20T12:00:00.000Z'), amount: 25 }],
         outgoingTransfers: [{ occurredOn: new Date('2026-04-10T12:00:00.000Z'), amount: 100, status: 'POSTED' }],
@@ -88,17 +102,20 @@ describe('FinanceService transaction rules', () => {
     const overview = await service.overview('user_1', 'household_1', '2026-04');
 
     expect(overview.referenceMonth).toBe('2026-04');
-    expect(overview.indicators).toMatchObject({ realizedIncome: 250, realizedExpenses: 0, pendingCommitments: 100, availableBalance: 1125 });
+    expect(overview.indicators).toMatchObject({ realizedIncome: 250, realizedExpenses: 0, pendingCommitments: 100, availableBalance: 1125, projectedAvailableBalance: 1025 });
     expect(overview.accounts[0].balance).toBe(1125);
+    expect(overview.accounts[0].projectedBalance).toBe(1025);
     expect(overview.comparison.expenses).toEqual({ current: 0, previous: 75 });
     expect(overview.charts.expenseByCategory).toEqual([]);
+    expect(overview.charts.projectedWeeklyFlow[1]).toEqual({ week: 2, income: 0, expenses: 100 });
+    expect(overview.charts.projectedExpenseByCategory).toEqual([{ categoryId: 'food', name: 'Mercado', color: '#654321', amount: 100 }]);
     expect(prisma.transaction.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ occurredOn: { gte: new Date('2026-04-01T12:00:00.000Z'), lt: new Date('2026-05-01T12:00:00.000Z') } }) }));
     expect(prisma.account.findMany).toHaveBeenCalledWith(expect.objectContaining({
       include: expect.objectContaining({
-        transactions: { where: { status: 'POSTED', occurredOn: { lt: new Date('2026-05-01T12:00:00.000Z') } } },
-        cardPayments: { where: { paidOn: { lt: new Date('2026-05-01T12:00:00.000Z') } } },
-        outgoingTransfers: { where: { status: 'POSTED', occurredOn: { lt: new Date('2026-05-01T12:00:00.000Z') } } },
-        incomingTransfers: { where: { status: 'POSTED', occurredOn: { lt: new Date('2026-05-01T12:00:00.000Z') } } },
+        transactions: { where: { deletedAt: null } },
+        cardPayments: true,
+        outgoingTransfers: { where: { deletedAt: null } },
+        incomingTransfers: { where: { deletedAt: null } },
       }),
     }));
   });
@@ -110,6 +127,49 @@ describe('FinanceService transaction rules', () => {
     const projected = project(rules, new Date('2026-12-01T12:00:00.000Z'), new Set(['rule_1:2026-10-08']));
     expect(projected.map((item) => item.occurredOn.toISOString().slice(0, 10))).toEqual(['2026-11-08']);
     expect(projected[0].isForecast).toBe(true);
+  });
+
+  it('uses only unpaid statements due in a future reference month', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-10-09T12:00:00.000Z'));
+    try {
+      households.assertMember.mockResolvedValue({ role: 'MEMBER' });
+      prisma.account.findMany.mockResolvedValue([]);
+      prisma.transaction.findMany.mockResolvedValue([]);
+      prisma.cardStatement.findMany.mockResolvedValue([{ id: 'statement_1', totalAmount: 900, payments: [{ amount: 250 }], card: {} }]);
+      prisma.recurringRule.findMany.mockResolvedValue([]);
+      prisma.monthlyBudget.findMany.mockResolvedValue([]);
+
+      const overview = await service.overview('user_1', 'household_1', '2026-11');
+
+      expect(overview.isForecast).toBe(true);
+      expect(overview.indicators.cardOpenTotal).toBe(650);
+      expect(prisma.cardStatement.findMany).toHaveBeenCalledWith(expect.objectContaining({
+        where: { householdId: 'household_1', status: { not: 'PAID' }, dueOn: { gte: new Date('2026-11-01T12:00:00.000Z'), lt: new Date('2026-12-01T12:00:00.000Z') } },
+      }));
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('lists active-card invoices with the unpaid balance used against each limit', async () => {
+    households.assertMember.mockResolvedValue({ role: 'MEMBER' });
+    const card = { id: 'card_1', isActive: true, creditLimit: 10_000 };
+    prisma.cardStatement.findMany
+      .mockResolvedValueOnce([{ id: 'statement_current', cardId: card.id, totalAmount: 2_500, status: 'OPEN', card, payments: [] }])
+      .mockResolvedValueOnce([
+        { id: 'statement_current', cardId: card.id, totalAmount: 2_500, status: 'OPEN', payments: [] },
+        { id: 'statement_previous', cardId: card.id, totalAmount: 3_000, status: 'CLOSED', payments: [{ amount: 1_000 }] },
+      ]);
+
+    const statements = await service.listStatements('user_1', 'household_1');
+
+    expect(statements[0]).toMatchObject({ id: 'statement_current', limitUsedAmount: 4_500, limitUsagePercent: 45 });
+    expect(prisma.cardStatement.findMany).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      where: expect.objectContaining({ householdId: 'household_1', card: { isActive: true } }),
+    }));
+    expect(prisma.cardStatement.findMany).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: { householdId: 'household_1', status: { not: 'PAID' }, card: { isActive: true } },
+    }));
   });
 
   it('calculates the household launch marker without changing the civil occurrence date', () => {
